@@ -64,4 +64,4 @@ The functional specification is informed by the original *SimLife: The Genetic P
 
 ## Licence
 
-No project software or documentation licence has yet been selected. Do not assume an open-source licence merely because the repository is public.
+This project's original code and documentation are licensed under the [MIT Licence](LICENSE). Copyright (c) 2026 Rick Dearman. The licence does not extend to third-party materials, including the original Maxis *SimLife* manual, software, artwork, trademarks or other protected assets.
