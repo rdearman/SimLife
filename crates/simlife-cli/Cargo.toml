@@ -1,0 +1,17 @@
+[package]
+name = "simlife-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "simlife-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+simlife-persistence = { path = "../simlife-persistence" }
+simlife-server = { path = "../simlife-server" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,67 +1,73 @@
-# SimLifeClone
+# SimLife
 
-**SimLifeClone** is an independently implemented ecosystem and evolutionary simulation inspired by the gameplay concepts described in *SimLife: The Genetic Playground* (Maxis, 1992). The aim is to create a playable single-player scientific sandbox first, extend it to persistent multiplayer planetary ecosystems, and then expand the simulation and gameplay.
+SimLife is a server-authoritative ecological simulation. Milestone M1 establishes a deterministic clock, independent worlds, checkpoint persistence, an HTTP/WebSocket API, and a small browser control panel. Biology and ecology mechanics are intentionally not part of M1.
 
-> **Project status:** Specification and architecture design. No working game or server implementation is included yet. The biological algorithms in the mechanics specification are proposals, not approved implementations.
+## Project direction
 
-## Vision
+SimLifeClone is a server-hosted, single-player scientific sandbox. The Rust engine is authoritative and independent of networking, persistence, and presentation. PostgreSQL stores durable world metadata and checkpoints; active simulation state stays in memory. The public interface uses versioned JSON over HTTP and WebSocket. The architecture preserves independent planetary worlds and later copy-based genome transfer without implementing multiplayer gameplay here.
 
-Players design organisms, introduce them into simulated ecosystems and observe their survival, reproduction, mutation, speciation and ecological effects. Organisms are autonomous; the player's role is that of a scientist or evolutionary designer, not a direct creature controller.
+The Phase 1 specifications are in [`docs/`](docs/). Their approved decisions govern the project. The detailed mechanics algorithms remain proposals; M1 deliberately implements no organism, genetics, reproduction, or ecological rules. M1 defaults are UUID world identifiers, a non-zero ChaCha8 seed, one integer tick per simulated day, an initial one-second day interval, JSON checkpoint payloads, and command event records. Checkpoints are written at world creation and after accepted control commands, never per internal tick. These defaults are implementation choices, not claims about original SimLife mechanics.
 
-The longer-term design introduces **independent persistent planetary worlds**. Each planet has its own climate, resources, populations, simulation clock and evolutionary history. Players can choose a planet into which to release a design. Organisms do not move between planets automatically: a player can deliberately copy a selected organism's genome from one world to another, creating a new evolutionary branch without removing the source organism.
+## Requirements
 
-## Development phases
+- Rust stable toolchain and Cargo
+- PostgreSQL 14 or later
+- Node.js 20 and npm
 
-| Phase | Goal | Scope |
-| --- | --- | --- |
-| **1 — Single-player** | Build and validate the simulation and playable browser client | Private worlds, world/organism editors, ecological and genetic simulation, observation, experiments, statistics, checkpoints and scenarios where applicable |
-| **2 — Multiplayer** | Introduce persistent shared planetary ecologies | Shared worlds, permissions, concurrent player introductions and deliberate interplanetary genome transfers |
-| **3 — Expansion** | Extend the simulation and game | Diverse planetary chemistry and biology, private evolutionary laboratories, additional ecological and gameplay systems |
+The Rust dependency graph is pinned by the committed `Cargo.lock`; the browser dependency graph is pinned by `web/package-lock.json`.
 
-Phase 1 is deliberately **single-player gameplay on a server-based architecture**. Multiplayer systems and exotic biology are not Phase 1 delivery requirements, but the architecture must not rule them out.
+## Local setup
 
-## Approved technical direction
+Create a PostgreSQL role and database for local development, then copy `.env.example` to `.env` and set `DATABASE_URL`. The server reads environment variables directly; export them in your shell (or use your preferred dotenv loader). Never commit `.env`.
 
-| Area | Decision |
-| --- | --- |
-| Simulation and server | **Rust**, with a headless simulation core independent of UI, database and networking |
-| Hosting | **Linux** |
-| Persistence | **PostgreSQL**; active simulation state held in memory and checkpointed durably |
-| Client/server protocol | Versioned **JSON over HTTP and WebSocket** |
-| First client | **Web browser** |
-| Possible subsequent clients | Android app / PWA and optional Godot client, sharing the same API |
-| Simulation | Independent world clocks; deterministic, single-threaded reference simulation for Phase 1 |
+```sh
+createdb simlife
+cp .env.example .env
+export DATABASE_URL='postgres://YOUR_USER:YOUR_PASSWORD@localhost:5432/simlife'
+export SIMLIFE_BIND='127.0.0.1:3000'
+```
 
-**Proposed, not yet approved implementation details** include Axum, Tokio, SQLx, Serde, TypeScript/Vite, Canvas 2D and a modular Cargo workspace. See the architecture specification for the full design, alternatives and boundaries.
+Migrations are applied automatically by the server at startup. To apply them explicitly:
 
-## Documentation
+```sh
+cargo install sqlx-cli --no-default-features --features rustls,postgres
+sqlx migrate run --source crates/simlife-persistence/migrations
+```
 
-| Document | Purpose |
-| --- | --- |
-| [Functional specification](docs/SimLife_Phase1_Functional_Specification.md) | Requirements traced to the original manual, plus approved design decisions (DD-001–DD-050) and Phase 1 boundaries |
-| [Simulation mechanics specification](docs/SimLife_Phase1_Mechanics_Specification.md) | Approved invariants, proposed tick/scheduler model and work packages for genetics, ecology, environment and experiments; numerical rules remain to be agreed |
-| [System architecture and implementation specification](docs/SimLife_System_Architecture_and_Implementation_Specification.md) | Rust/Linux/PostgreSQL architecture, proposed Cargo structure, API, persistence, client design, security, testing and milestones |
+## Build, test, run
 
-The documents distinguish **documented original behaviour**, **approved game-design decisions**, **implementation proposals** and **unresolved mechanics**. They are living specifications, not evidence that all decisions have been implemented.
+```sh
+cargo fmt --all -- --check
+cargo build --workspace
+cargo test --workspace
+cargo run -p simlife-cli
+```
 
-## Key design principles
+The server listens on `SIMLIFE_BIND` (default `127.0.0.1:3000`), requires `DATABASE_URL`, applies migrations, and restores the latest checkpoint of each world at startup.
 
-- One authoritative simulation engine, with no client-specific simulation rules.
-- Simulation state changes only through validated commands; clients may disconnect without automatically stopping a running world.
-- Deterministic evolution and experiment replay, including checkpoints and branching histories.
-- Population-level and individual-level simulation, with preservation of genetic distributions and resources where aggregation is used.
-- Independent planetary worlds with no automatic inter-world biological migration.
-- World-independent, versioned genome definitions to allow future deliberate exports and introductions.
-- Terrestrial biology initially; no unnecessary Earth-specific assumptions in long-term engine interfaces.
+In another shell:
 
-## Getting started
+```sh
+cd web
+npm install
+npm run dev
+```
 
-This repository currently contains specifications only. There is no installable application, database schema or build command yet. The planned initial milestone is a Rust Cargo workspace, a headless deterministic simulation skeleton, PostgreSQL migrations, a versioned JSON API and a minimal browser interface. Implementation should follow the approved requirements and record any deviations as explicit design decisions.
+Open the Vite URL (normally `http://127.0.0.1:5173`). Set `VITE_API_URL` if the API is not at `http://127.0.0.1:3000`.
 
-## Source material and intellectual property
+## API
 
-The functional specification is informed by the original *SimLife: The Genetic Playground* user manual (Maxis, 1992). **The original manual is not included in this repository** because it is copyrighted source material and this project does not establish redistribution permission. This project is an independent reimplementation of simulation ideas, not a copy of Maxis source code, graphics, audio, interface assets or branding. The name *SimLife* is used here only to identify the historical inspiration; the project name is **SimLifeClone**.
+All endpoints are versioned under `/api/v1`:
 
-## Licence
+- `GET /health`
+- `GET /worlds`
+- `POST /worlds` with `{ "name": "Earth", "seed": 42, "tick_duration_seconds": 1 }`
+- `GET /worlds/{id}`
+- `POST /worlds/{id}/commands` with `{ "command": "start" }`, `pause`, `resume`, or `{ "command": "advance", "ticks": 1 }`
+- `GET /worlds/{id}/stream` (WebSocket snapshot/update stream)
 
-This project's original code and documentation are licensed under the [MIT Licence](LICENSE). Copyright (c) 2026 Rick Dearman. The licence does not extend to third-party materials, including the original Maxis *SimLife* manual, software, artwork, trademarks or other protected assets.
+Start transitions a new world to running; pause and resume require their matching current states. Advance is accepted only while running and is limited to 100,000 ticks per request. Each tick represents one simulated day. In M1, progression is explicit through the advance command; an autonomous world supervisor and playback-speed scheduler are later work. The server owns and mutates all simulation state.
+
+## M1 limits
+
+M1 does not yet include accounts, authentication, an autonomous wall-clock runner, graphical ecology, or detailed biological mechanics. The browser client is intended for local development. World snapshots currently include only the deterministic clock and seeded random stream marker. The PostgreSQL integration test requires `DATABASE_URL`; without it, that test reports a skip. No claim of live database verification is made unless it is run against a PostgreSQL service.
