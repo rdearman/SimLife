@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 #[derive(Clone)]
 struct AppState {
-    worlds: Arc<Mutex<HashMap<WorldId, World>>>,
+    worlds: Arc<Mutex<HashMap<WorldId, Arc<Mutex<World>>>>>,
     updates: broadcast::Sender<WorldSnapshot>,
     store: Arc<Store>,
 }
@@ -31,7 +31,7 @@ pub async fn app(store: Store) -> Result<Router, sqlx::Error> {
         .filter_map(|snapshot| {
             World::restore(&snapshot)
                 .ok()
-                .map(|world| (snapshot.id, world))
+                .map(|world| (snapshot.id, Arc::new(Mutex::new(world))))
         })
         .collect();
     let state = AppState {
@@ -83,30 +83,35 @@ async fn create_world(
         .checkpoint(&snapshot)
         .await
         .map_err(ApiError::internal)?;
-    s.worlds.lock().await.insert(id, world);
+    s.worlds
+        .lock()
+        .await
+        .insert(id, Arc::new(Mutex::new(world)));
     let _ = s.updates.send(snapshot.clone());
     Ok((StatusCode::CREATED, Json(snapshot)))
 }
 async fn list_worlds(State(s): State<AppState>) -> Json<Vec<WorldSnapshot>> {
-    Json(
-        s.worlds
-            .lock()
-            .await
-            .values()
-            .map(World::snapshot)
-            .collect(),
-    )
+    let worlds: Vec<_> = s.worlds.lock().await.values().cloned().collect();
+    let mut snapshots = Vec::with_capacity(worlds.len());
+    for world in worlds {
+        snapshots.push(world.lock().await.snapshot());
+    }
+    Json(snapshots)
 }
 async fn get_world(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<WorldSnapshot>, ApiError> {
     let id = parse_id(&id)?;
-    let worlds = s.worlds.lock().await;
-    worlds
+    let world = s
+        .worlds
+        .lock()
+        .await
         .get(&id)
-        .map(|w| Json(w.snapshot()))
-        .ok_or_else(ApiError::not_found)
+        .cloned()
+        .ok_or_else(ApiError::not_found)?;
+    let snapshot = world.lock().await.snapshot();
+    Ok(Json(snapshot))
 }
 async fn command(
     State(s): State<AppState>,
@@ -114,12 +119,16 @@ async fn command(
     Json(command): Json<SimulationCommand>,
 ) -> Result<Json<WorldSnapshot>, ApiError> {
     let id = parse_id(&id)?;
-    let snapshot = {
-        let mut worlds = s.worlds.lock().await;
-        let world = worlds.get_mut(&id).ok_or_else(ApiError::not_found)?;
-        world.apply(command.clone()).map_err(ApiError::engine)?;
-        world.snapshot()
-    };
+    let world = s
+        .worlds
+        .lock()
+        .await
+        .get(&id)
+        .cloned()
+        .ok_or_else(ApiError::not_found)?;
+    let mut world = world.lock().await;
+    world.apply(command.clone()).map_err(ApiError::engine)?;
+    let snapshot = world.snapshot();
     s.store
         .record_command(&snapshot, &serde_json::to_string(&command).unwrap())
         .await
@@ -130,6 +139,7 @@ async fn command(
         .await
         .map_err(ApiError::internal)?;
     let _ = s.updates.send(snapshot.clone());
+    drop(world);
     Ok(Json(snapshot))
 }
 async fn websocket(
@@ -145,8 +155,9 @@ async fn websocket(
 }
 async fn stream_world(mut socket: WebSocket, s: AppState, id: WorldId) {
     let mut rx = s.updates.subscribe();
-    if let Some(world) = s.worlds.lock().await.get(&id) {
-        if let Ok(json) = serde_json::to_string(&world.snapshot()) {
+    let world = s.worlds.lock().await.get(&id).cloned();
+    if let Some(world) = world {
+        if let Ok(json) = serde_json::to_string(&world.lock().await.snapshot()) {
             if socket.send(Message::Text(json)).await.is_err() {
                 return;
             }
@@ -200,6 +211,7 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
     #[test]
     fn create_request_rejects_empty_name() {
         let c = WorldConfig {
@@ -244,5 +256,98 @@ mod tests {
         let received = rx.recv().await.unwrap();
         assert_eq!(received.tick, expected.tick);
         assert_eq!(received.id, expected.id);
+    }
+
+    #[tokio::test]
+    async fn websocket_endpoint_delivers_world_updates() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping WebSocket integration test: DATABASE_URL is unset");
+            return;
+        };
+        let store = Store::connect(&url).await.unwrap();
+        let app = app(store).await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let created: WorldSnapshot = client
+            .post(format!("http://{address}/api/v1/worlds"))
+            .json(
+                &serde_json::json!({"name":"websocket-test","seed":177,"tick_duration_seconds":1}),
+            )
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{address}/api/v1/worlds/{}/stream",
+            created.id.0
+        ))
+        .await
+        .unwrap();
+        let initial = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<WorldSnapshot>(&initial)
+                .unwrap()
+                .tick,
+            0
+        );
+        client
+            .post(format!(
+                "http://{address}/api/v1/worlds/{}/commands",
+                created.id.0
+            ))
+            .json(&SimulationCommand::Start)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let started = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<WorldSnapshot>(&started)
+                .unwrap()
+                .tick,
+            0
+        );
+        client
+            .post(format!(
+                "http://{address}/api/v1/worlds/{}/commands",
+                created.id.0
+            ))
+            .json(&SimulationCommand::Advance { ticks: 1 })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let update = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<WorldSnapshot>(&update).unwrap().tick,
+            1
+        );
+        server.abort();
     }
 }

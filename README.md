@@ -70,4 +70,4 @@ Start transitions a new world to running; pause and resume require their matchin
 
 ## M1 limits
 
-M1 does not yet include accounts, authentication, an autonomous wall-clock runner, graphical ecology, or detailed biological mechanics. The browser client is intended for local development. World snapshots currently include only the deterministic clock and seeded random stream marker. The PostgreSQL integration test requires `DATABASE_URL`; without it, that test reports a skip. No claim of live database verification is made unless it is run against a PostgreSQL service.
+M1 does not yet include accounts, authentication, an autonomous wall-clock runner, graphical ecology, or detailed biological mechanics. The browser client is intended for local development. World snapshots currently include only the deterministic clock and seeded random stream marker. PostgreSQL migration/recovery and end-to-end WebSocket integration tests require `DATABASE_URL`; without it, those tests report a skip. No claim of live database verification is made unless they are run against a PostgreSQL service.

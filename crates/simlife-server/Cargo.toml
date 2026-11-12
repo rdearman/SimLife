@@ -16,3 +16,7 @@ tower-http.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio-tungstenite = "0.24"
