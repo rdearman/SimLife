@@ -9,6 +9,7 @@ SimLife is a server-authoritative deterministic ecology sandbox. This repository
 - `simlife-persistence`: SQLx PostgreSQL store and migrations.
 - `simlife-server`: Axum HTTP/WebSocket API and per-world asynchronous clock tasks.
 - `simlife-cli`: server executable.
+- `simlife-bench`: reproducible seeded engine benchmark for throughput, memory, and population change.
 - `web`: TypeScript/React control panel and terrain viewer.
 
 ## Implemented simulation rules and defaults
@@ -23,7 +24,7 @@ The mechanics specification labels detailed formulas as proposals. These M2–M6
 - The single-threaded engine orders organisms by stable ID and uses integer arithmetic. The canonical state hash includes terrain, resources, organisms, counters, and random state, but excludes the world UUID and display name; identical seeds therefore generate the same initial world and produce equal states under equal commands.
 - The server starts an independent clock task for each running world. State stays in memory between checkpoints. Checkpoints are written at creation, after accepted commands, and every 100 simulated days, not on every tick. Startup restores the newest checkpoint for each world.
 
-The M5 client lists/creates worlds, selects map size and tick interval, displays terrain and organisms, reports status/day/population/births/deaths, receives WebSocket changes, starts/pauses/resumes worlds, advances a day, and introduces a starter organism on a selected tile. Map color and red organism markers are presentation only.
+The M5 client lists/creates worlds, selects map size and tick interval, displays terrain and organisms, reports status/day/population/births/deaths, receives WebSocket changes, starts/pauses/resumes worlds, advances a day, and introduces a configured founder organism on a selected tile. It plots rolling total and diet-specific population history. Map color and red organism markers are presentation only.
 
 ## Requirements
 
@@ -74,6 +75,22 @@ npm run dev
 
 Open the Vite URL (normally `http://127.0.0.1:5173`). Set `VITE_API_URL` in the client environment if the API uses a different origin. Browser CORS is permissive for local development; put the server behind an appropriate deployment boundary before exposing it publicly.
 
+## Benchmarking and population observation
+
+Build the release benchmark and run the same seeded, 100-day workload at several population sizes. Run each size as its own process so peak resident memory is attributable to that case:
+
+```sh
+cargo build -p simlife-bench --release
+./target/release/simlife-bench 1000 100 20261113 large
+./target/release/simlife-bench 10000 100 20261113 large
+./target/release/simlife-bench 50000 100 20261113 large
+./target/release/simlife-bench 100000 100 20261113 large
+```
+
+The benchmark prints JSON containing setup time, ticks per second, population change, births/deaths, peak process RSS, and the final state hash. Throughput includes each tick plus construction of the compact live update and its deterministic state hash. It excludes database checkpoints, HTTP, and browser work. Linux `VmHWM` is used for peak memory; other platforms report `null`. These measurements are a single local baseline, not a capacity guarantee. See [`docs/benchmarks/2026-11-13-baseline.md`](docs/benchmarks/2026-11-13-baseline.md).
+
+The simulation records population, diet counts, average expressed speed/metabolism/fertility, and cumulative births/deaths every 10 days. The rolling history holds up to 20,000 samples (200,000 simulated days); checkpoints preserve it. The browser plots total population and population by diet. World listing returns compact summaries; selecting a world fetches its full map and history.
+
 ## API
 
 All routes are versioned under `/api/v1`:
@@ -90,4 +107,4 @@ World configuration requires a non-empty name, non-zero 64-bit seed, and tick in
 
 ## Current limits
 
-This implementation provides a first playable individual-organism ecology, not every Phase 1 proposal. The hybrid aggregate population model, richer environmental/weather systems, species lineage/speciation, sophisticated multi-step predation, genome editing, multi-player accounts, and production authentication are not implemented. Population is capped at 100,000 organisms per world. Replay currently starts from the original seed and walks accepted command history, so replay cost grows with world age; it is intended as a verification/recovery foundation while checkpoints provide fast restart recovery. The reproducibility guarantee targets supported Rust platforms with the current versioned integer rules; changing simulation algorithms requires a state-hash/version migration. PostgreSQL migration/recovery and network WebSocket integration tests require a reachable disposable database via `DATABASE_URL`; without one, those tests exit early and must be reported as skipped, not as database verification.
+This implementation provides a first playable individual-organism ecology, not every Phase 1 proposal. The hybrid aggregate population model, richer environmental/weather systems, robust species lineage/speciation, sophisticated multi-step predation, genome editing, multi-player accounts, and production authentication are not implemented. Population is capped at 100,000 organisms per world. Replay currently starts from the original seed and walks accepted command history, so replay cost grows with world age; it is intended as a verification/recovery foundation while checkpoints provide fast restart recovery. The reproducibility guarantee targets supported Rust platforms with the current versioned integer rules; changing simulation algorithms requires a state-hash/version migration. PostgreSQL migration/recovery and network WebSocket integration tests require a reachable disposable database via `DATABASE_URL`; without one, those tests exit early and must be reported as skipped, not as database verification.

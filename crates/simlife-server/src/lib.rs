@@ -9,7 +9,7 @@ use axum::{
     Json, Router,
 };
 use simlife_domain::{
-    SimulationCommand, WorldConfig, WorldId, WorldSize, WorldSnapshot, WorldUpdate,
+    SimulationCommand, WorldConfig, WorldId, WorldSize, WorldSnapshot, WorldSummary, WorldUpdate,
 };
 use simlife_engine::{EngineError, World};
 use simlife_persistence::Store;
@@ -149,11 +149,11 @@ fn spawn_world_scheduler(s: AppState, id: WorldId) {
         }
     });
 }
-async fn list_worlds(State(s): State<AppState>) -> Json<Vec<WorldSnapshot>> {
+async fn list_worlds(State(s): State<AppState>) -> Json<Vec<WorldSummary>> {
     let worlds: Vec<_> = s.worlds.lock().await.values().cloned().collect();
     let mut snapshots = Vec::with_capacity(worlds.len());
     for world in worlds {
-        snapshots.push(world.lock().await.snapshot());
+        snapshots.push(world.lock().await.summary());
     }
     Json(snapshots)
 }
@@ -383,6 +383,22 @@ mod tests {
             .json()
             .await
             .unwrap();
+        let summaries: Vec<WorldSummary> = client
+            .get(format!("http://{address}/api/v1/worlds"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let summary = summaries
+            .iter()
+            .find(|world| world.id == created.id)
+            .unwrap();
+        assert_eq!(summary.population, 0);
+        assert_eq!(summary.width, 32);
         let (mut socket, _) = tokio_tungstenite::connect_async(format!(
             "ws://{address}/api/v1/worlds/{}/stream",
             created.id.0

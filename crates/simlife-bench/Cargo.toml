@@ -1,0 +1,9 @@
+[package]
+name = "simlife-bench"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+simlife-domain = { path = "../simlife-domain" }
+simlife-engine = { path = "../simlife-engine" }

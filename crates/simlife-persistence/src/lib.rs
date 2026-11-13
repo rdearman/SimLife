@@ -220,14 +220,11 @@ mod tests {
                 .state_hash,
             snapshot.state_hash
         );
-        assert_eq!(
-            store
-                .replay(snapshot.id, snapshot.tick)
-                .await
-                .unwrap()
-                .state_hash,
-            snapshot.state_hash
-        );
+        let recovered = store.recover(snapshot.id).await.unwrap().unwrap();
+        assert_eq!(recovered.population_history, snapshot.population_history);
+        let replayed = store.replay(snapshot.id, snapshot.tick).await.unwrap();
+        assert_eq!(replayed.state_hash, snapshot.state_hash);
+        assert_eq!(replayed.population_history, snapshot.population_history);
         sqlx::query("DELETE FROM worlds WHERE id=$1")
             .bind(snapshot.id.0)
             .execute(&store.pool)

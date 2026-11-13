@@ -1,13 +1,16 @@
 use blake3::Hasher;
 use serde::Serialize;
 use simlife_domain::{
-    Alleles, Diet, Genome, Organism, Resources, RunState, Sex, SimulationCommand, TerrainType,
-    Tile, WorldConfig, WorldId, WorldSnapshot, WorldStatistics, WorldUpdate,
+    Alleles, Diet, Genome, Organism, PopulationSample, Resources, RunState, Sex, SimulationCommand,
+    TerrainType, Tile, WorldConfig, WorldId, WorldSnapshot, WorldStatistics, WorldSummary,
+    WorldUpdate,
 };
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 const MAX_ORGANISMS: usize = 100_000;
+const POPULATION_SAMPLE_EVERY_DAYS: u64 = 10;
+const MAX_POPULATION_SAMPLES: usize = 20_000;
 const INITIAL_ENERGY: u32 = 100;
 const INITIAL_WATER: u32 = 30;
 
@@ -72,6 +75,7 @@ pub struct World {
     tiles: Vec<Tile>,
     organisms: Vec<Organism>,
     statistics: WorldStatistics,
+    population_history: Vec<PopulationSample>,
     rng: DeterministicRng,
     next_organism_id: u64,
 }
@@ -82,7 +86,7 @@ impl World {
         let (width, height) = config.size.dimensions();
         let mut rng = DeterministicRng::new(config.seed);
         let tiles = generate_terrain(width, height, &mut rng);
-        Ok(Self {
+        let mut world = Self {
             id,
             config,
             state: RunState::Created,
@@ -92,9 +96,12 @@ impl World {
             tiles,
             organisms: Vec::new(),
             statistics: WorldStatistics::default(),
+            population_history: Vec::new(),
             rng,
             next_organism_id: 1,
-        })
+        };
+        world.sample_population();
+        Ok(world)
     }
 
     pub fn apply(&mut self, command: SimulationCommand) -> Result<(), EngineError> {
@@ -169,6 +176,37 @@ impl World {
             water_reserve: INITIAL_WATER,
             genome,
         });
+        if self.tick.is_multiple_of(POPULATION_SAMPLE_EVERY_DAYS) {
+            self.sample_population();
+        }
+        Ok(())
+    }
+
+    /// Add deterministic, uniformly placed founders for controlled experiments and benchmarks.
+    pub fn seed_population(&mut self, count: usize, genome: Genome) -> Result<(), EngineError> {
+        genome.validate().map_err(EngineError::InvalidConfig)?;
+        if count > MAX_ORGANISMS.saturating_sub(self.organisms.len()) {
+            return Err(EngineError::PopulationLimit);
+        }
+        if self.state != RunState::Created || self.tick != 0 {
+            return Err(EngineError::InvalidTransition(self.state));
+        }
+        let species_id = self.next_organism_id;
+        for _ in 0..count {
+            let id = self.next_organism_id;
+            self.next_organism_id += 1;
+            self.organisms.push(Organism {
+                id,
+                species_id,
+                x: self.rng.below(u64::from(self.width)) as u16,
+                y: self.rng.below(u64::from(self.height)) as u16,
+                age_days: 0,
+                energy: INITIAL_ENERGY,
+                water_reserve: INITIAL_WATER,
+                genome: genome.clone(),
+            });
+        }
+        self.sample_population();
         Ok(())
     }
 
@@ -180,6 +218,49 @@ impl World {
         self.resolve_predation();
         self.resolve_deaths();
         self.reproduce();
+        if self.tick.is_multiple_of(POPULATION_SAMPLE_EVERY_DAYS) {
+            self.sample_population();
+        }
+    }
+
+    fn sample_population(&mut self) {
+        let mut sample = PopulationSample {
+            day: self.tick,
+            births: self.statistics.births,
+            deaths: self.statistics.deaths,
+            ..PopulationSample::default()
+        };
+        let mut speed = 0_u64;
+        let mut metabolism = 0_u64;
+        let mut fertility = 0_u64;
+        for organism in &self.organisms {
+            sample.population += 1;
+            match organism.genome.diet {
+                Diet::Herbivore => sample.herbivores += 1,
+                Diet::Carnivore => sample.carnivores += 1,
+                Diet::Omnivore => sample.omnivores += 1,
+            }
+            speed += u64::from(organism.genome.speed.expressed());
+            metabolism += u64::from(organism.genome.metabolism.expressed());
+            fertility += u64::from(organism.genome.fertility.expressed());
+        }
+        if sample.population > 0 {
+            let count = u64::from(sample.population);
+            sample.average_speed = (speed / count) as u8;
+            sample.average_metabolism = (metabolism / count) as u8;
+            sample.average_fertility = (fertility / count) as u8;
+        }
+        if self
+            .population_history
+            .last()
+            .is_some_and(|last| last.day == sample.day)
+        {
+            self.population_history.pop();
+        }
+        self.population_history.push(sample);
+        if self.population_history.len() > MAX_POPULATION_SAMPLES {
+            self.population_history.drain(..MAX_POPULATION_SAMPLES / 10);
+        }
     }
 
     fn regenerate_resources(&mut self) {
@@ -370,6 +451,7 @@ impl World {
             tiles: self.tiles.clone(),
             organisms: self.organisms.clone(),
             statistics: self.statistics.clone(),
+            population_history: self.population_history.clone(),
             rng_state: self.rng.state(),
             next_organism_id: self.next_organism_id,
             state_hash,
@@ -383,6 +465,25 @@ impl World {
             state: self.state,
             tick: self.tick,
             organisms: self.organisms.clone(),
+            statistics: self.statistics.clone(),
+            population_sample: self
+                .population_history
+                .last()
+                .filter(|sample| sample.day == self.tick)
+                .cloned(),
+            state_hash: self.state_hash(),
+        }
+    }
+
+    pub fn summary(&self) -> WorldSummary {
+        WorldSummary {
+            id: self.id,
+            config: self.config.clone(),
+            state: self.state,
+            tick: self.tick,
+            width: self.width,
+            height: self.height,
+            population: self.organisms.len() as u32,
             statistics: self.statistics.clone(),
             state_hash: self.state_hash(),
         }
@@ -412,6 +513,7 @@ impl World {
         };
         let bytes = serde_json::to_vec(&state).expect("canonical state serializes");
         let mut hasher = Hasher::new();
+        // Population history is derived telemetry, not authoritative simulation state.
         hasher.update(b"simlife-world-state-v2\0");
         hasher.update(&bytes);
         hasher.finalize().to_hex().to_string()
@@ -434,6 +536,26 @@ impl World {
         }) {
             return Err(EngineError::InvalidCheckpoint);
         }
+        if snapshot.population_history.len() > MAX_POPULATION_SAMPLES
+            || snapshot.population_history.iter().any(|sample| {
+                sample.day > snapshot.tick
+                    || !sample.day.is_multiple_of(POPULATION_SAMPLE_EVERY_DAYS)
+                    || sample.population as usize > MAX_ORGANISMS
+                    || u64::from(sample.herbivores)
+                        + u64::from(sample.carnivores)
+                        + u64::from(sample.omnivores)
+                        != u64::from(sample.population)
+                    || sample.average_speed > 4
+                    || sample.average_metabolism > 20
+                    || sample.average_fertility > 100
+            })
+            || snapshot
+                .population_history
+                .windows(2)
+                .any(|pair| pair[0].day >= pair[1].day)
+        {
+            return Err(EngineError::InvalidCheckpoint);
+        }
         let world = Self {
             id: snapshot.id,
             config: snapshot.config.clone(),
@@ -444,6 +566,7 @@ impl World {
             tiles: snapshot.tiles.clone(),
             organisms: snapshot.organisms.clone(),
             statistics: snapshot.statistics.clone(),
+            population_history: snapshot.population_history.clone(),
             rng: DeterministicRng {
                 state: snapshot.rng_state,
             },
@@ -809,5 +932,40 @@ mod tests {
             .apply(SimulationCommand::Advance { ticks: 30 })
             .unwrap();
         assert!(world.statistics.births > 0);
+    }
+
+    #[test]
+    fn sampled_population_history_is_deterministic_and_tracks_traits() {
+        let mut first = World::new(WorldId::new(), config(9_901)).unwrap();
+        let mut second = World::new(WorldId::new(), config(9_901)).unwrap();
+        let genome = Genome {
+            speed: Alleles {
+                first: 3,
+                second: 3,
+            },
+            fertility: Alleles {
+                first: 0,
+                second: 0,
+            },
+            ..Genome::default()
+        };
+        first.seed_population(100, genome.clone()).unwrap();
+        second.seed_population(100, genome).unwrap();
+        assert_eq!(first.snapshot().state_hash, second.snapshot().state_hash);
+        first.apply(SimulationCommand::Start).unwrap();
+        second.apply(SimulationCommand::Start).unwrap();
+        first
+            .apply(SimulationCommand::Advance { ticks: 10 })
+            .unwrap();
+        second
+            .apply(SimulationCommand::Advance { ticks: 10 })
+            .unwrap();
+        let snapshot = first.snapshot();
+        assert_eq!(snapshot.state_hash, second.snapshot().state_hash);
+        assert_eq!(snapshot.population_history.len(), 2);
+        let sample = snapshot.population_history.last().unwrap();
+        assert_eq!(sample.day, 10);
+        assert_eq!(sample.population as usize, snapshot.organisms.len());
+        assert_eq!(sample.average_speed, 3);
     }
 }

@@ -199,6 +199,33 @@ pub struct WorldStatistics {
     pub predation_deaths: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+pub struct PopulationSample {
+    pub day: u64,
+    pub population: u32,
+    pub herbivores: u32,
+    pub carnivores: u32,
+    pub omnivores: u32,
+    pub average_speed: u8,
+    pub average_metabolism: u8,
+    pub average_fertility: u8,
+    pub births: u64,
+    pub deaths: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorldSummary {
+    pub id: WorldId,
+    pub config: WorldConfig,
+    pub state: RunState,
+    pub tick: u64,
+    pub width: u16,
+    pub height: u16,
+    pub population: u32,
+    pub statistics: WorldStatistics,
+    pub state_hash: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorldSnapshot {
     pub id: WorldId,
@@ -210,6 +237,8 @@ pub struct WorldSnapshot {
     pub tiles: Vec<Tile>,
     pub organisms: Vec<Organism>,
     pub statistics: WorldStatistics,
+    #[serde(default)]
+    pub population_history: Vec<PopulationSample>,
     pub rng_state: u64,
     pub next_organism_id: u64,
     pub state_hash: String,
@@ -224,6 +253,7 @@ pub struct WorldUpdate {
     pub tick: u64,
     pub organisms: Vec<Organism>,
     pub statistics: WorldStatistics,
+    pub population_sample: Option<PopulationSample>,
     pub state_hash: String,
 }
 impl From<&WorldSnapshot> for WorldUpdate {
@@ -235,6 +265,11 @@ impl From<&WorldSnapshot> for WorldUpdate {
             tick: snapshot.tick,
             organisms: snapshot.organisms.clone(),
             statistics: snapshot.statistics.clone(),
+            population_sample: snapshot
+                .population_history
+                .last()
+                .filter(|sample| sample.day == snapshot.tick)
+                .cloned(),
             state_hash: snapshot.state_hash.clone(),
         }
     }
