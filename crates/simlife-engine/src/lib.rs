@@ -2,9 +2,9 @@ use blake3::Hasher;
 use serde::Serialize;
 use simlife_domain::{
     AlleleFrequencySample, Alleles, Diet, Genome, Organism, OrganismInspection, OrganismLineage,
-    PopulationSample, Resources, RunState, Sex, SimulationCommand, SpeciationEvent, SpeciesLineage,
-    TerrainType, Tile, WorldConfig, WorldId, WorldSnapshot, WorldStatistics, WorldSummary,
-    WorldUpdate,
+    PopulationSample, ResourceSummary, Resources, RunState, Sex, SimulationCommand,
+    SpeciationEvent, SpeciesLineage, TerrainType, Tile, WorldConfig, WorldId, WorldSnapshot,
+    WorldStatistics, WorldSummary, WorldUpdate,
 };
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
@@ -123,7 +123,10 @@ impl World {
             height,
             tiles,
             organisms: Vec::new(),
-            statistics: WorldStatistics::default(),
+            statistics: WorldStatistics {
+                death_diagnostics_start_day: Some(0),
+                ..WorldStatistics::default()
+            },
             population_history: Vec::new(),
             allele_frequency_history: Vec::new(),
             organism_lineage: Vec::new(),
@@ -259,6 +262,9 @@ impl World {
 
     fn advance_one_day(&mut self) {
         self.tick += 1;
+        if self.statistics.death_diagnostics_start_day.is_none() {
+            self.statistics.death_diagnostics_start_day = Some(self.tick);
+        }
         self.regenerate_resources();
         self.move_and_metabolize();
         self.feed_herbivores();
@@ -482,16 +488,31 @@ impl World {
     }
 
     fn resolve_deaths(&mut self) {
-        let dead_ids: Vec<_> = self
+        let dead: Vec<_> = self
             .organisms
             .iter()
             .filter(|o| {
                 o.energy == 0 || o.water_reserve == 0 || o.age_days >= o.genome.lifespan_days
             })
-            .map(|o| o.id)
+            .map(|o| {
+                (
+                    o.id,
+                    o.energy == 0,
+                    o.water_reserve == 0,
+                    o.age_days >= o.genome.lifespan_days,
+                )
+            })
             .collect();
-        for organism_id in dead_ids {
-            self.record_death(organism_id);
+        for (organism_id, starvation, dehydration, age) in &dead {
+            self.record_death(*organism_id);
+            // Conditions are exclusive and use a stable precedence for player-facing attribution.
+            if *age {
+                self.statistics.age_deaths += 1;
+            } else if *dehydration {
+                self.statistics.dehydration_deaths += 1;
+            } else if *starvation {
+                self.statistics.starvation_deaths += 1;
+            }
         }
         let old_len = self.organisms.len();
         self.organisms
@@ -756,6 +777,7 @@ impl World {
             tick: self.tick,
             organisms: self.organisms.clone(),
             statistics: self.statistics.clone(),
+            resource_summary: ResourceSummary::from_tiles(&self.tiles),
             population_sample: self
                 .population_history
                 .last()
@@ -804,11 +826,17 @@ impl World {
             organism_lineage: &'a [OrganismLineage],
             species_lineages: &'a [SpeciesLineage],
             speciation_events: &'a [SpeciationEvent],
-            statistics: &'a WorldStatistics,
+            statistics: CanonicalStatistics,
             rng_state: u64,
             next_organism_id: u64,
             next_species_id: u64,
             mechanics_version: u16,
+        }
+        #[derive(Serialize)]
+        struct CanonicalStatistics {
+            births: u64,
+            deaths: u64,
+            predation_deaths: u64,
         }
         let state = Canonical {
             tick: self.tick,
@@ -819,7 +847,11 @@ impl World {
             organism_lineage: &self.organism_lineage,
             species_lineages: &self.species_lineages,
             speciation_events: &self.speciation_events,
-            statistics: &self.statistics,
+            statistics: CanonicalStatistics {
+                births: self.statistics.births,
+                deaths: self.statistics.deaths,
+                predation_deaths: self.statistics.predation_deaths,
+            },
             rng_state: self.rng.state(),
             next_organism_id: self.next_organism_id,
             next_species_id: self.next_species_id,
@@ -827,7 +859,8 @@ impl World {
         };
         let bytes = serde_json::to_vec(&state).expect("canonical state serializes");
         let mut hasher = Hasher::new();
-        // Population history is derived telemetry, not authoritative simulation state.
+        // Population history and death-cause diagnostics are derived telemetry, not
+        // authoritative simulation state. Keep this payload compatible with v4 hashes.
         hasher.update(b"simlife-world-state-v4\0");
         hasher.update(&bytes);
         hasher.finalize().to_hex().to_string()
@@ -1316,7 +1349,75 @@ mod tests {
             .unwrap();
         assert!(world.organisms.is_empty());
         assert_eq!(world.statistics.deaths, 1);
+        assert_eq!(world.statistics.age_deaths, 1);
         assert_eq!(world.organism_lineage[0].died_day, Some(1));
+    }
+
+    #[test]
+    fn death_diagnostics_and_live_resource_summary_are_reported() {
+        let mut world = World::new(WorldId::new(), config(18)).unwrap();
+        let genome = Genome {
+            speed: Alleles {
+                first: 0,
+                second: 0,
+            },
+            metabolism: Alleles {
+                first: 0,
+                second: 0,
+            },
+            diet: Diet::Carnivore,
+            ..Genome::default()
+        };
+        world
+            .apply(SimulationCommand::IntroduceOrganism {
+                x: 1,
+                y: 1,
+                genome: genome.clone(),
+            })
+            .unwrap();
+        world
+            .apply(SimulationCommand::IntroduceOrganism { x: 2, y: 2, genome })
+            .unwrap();
+        let dry_tile = tile_index(world.width, 2, 2);
+        world.tiles[dry_tile].terrain = TerrainType::Plains;
+        world.tiles[dry_tile].resources.water = 0;
+        world.organisms[0].energy = 0;
+        world.organisms[1].water_reserve = 0;
+        world.apply(SimulationCommand::Start).unwrap();
+        world
+            .apply(SimulationCommand::Advance { ticks: 1 })
+            .unwrap();
+
+        assert_eq!(world.statistics.starvation_deaths, 1);
+        assert_eq!(world.statistics.dehydration_deaths, 1);
+        let resources = world.update().resource_summary;
+        assert!(resources.land_tiles > 0);
+        assert!(resources.vegetation > 0);
+        assert!(resources.water > 0);
+    }
+
+    #[test]
+    fn checkpoints_without_death_diagnostics_restore_with_hash_compatibility() {
+        let world = World::new(WorldId::new(), config(21)).unwrap();
+        let mut old_checkpoint = serde_json::to_value(world.snapshot()).unwrap();
+        let statistics = old_checkpoint
+            .get_mut("statistics")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        statistics.remove("starvation_deaths");
+        statistics.remove("dehydration_deaths");
+        statistics.remove("age_deaths");
+        statistics.remove("death_diagnostics_start_day");
+        let old_checkpoint: WorldSnapshot = serde_json::from_value(old_checkpoint).unwrap();
+
+        let mut restored = World::restore(&old_checkpoint).unwrap();
+        assert_eq!(restored.summary().state_hash, old_checkpoint.state_hash);
+        assert_eq!(restored.statistics.death_diagnostics_start_day, None);
+        restored.apply(SimulationCommand::Start).unwrap();
+        restored
+            .apply(SimulationCommand::Advance { ticks: 1 })
+            .unwrap();
+        assert_eq!(restored.statistics.death_diagnostics_start_day, Some(1));
     }
 
     #[test]

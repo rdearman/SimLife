@@ -91,6 +91,39 @@ pub struct Resources {
     pub minerals: u32,
 }
 
+/// Live land-resource totals for player-facing ecological feedback.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+pub struct ResourceSummary {
+    pub land_tiles: u32,
+    pub vegetation: u64,
+    pub water: u64,
+    pub depleted_land_tiles: u32,
+    pub dry_land_tiles: u32,
+}
+impl ResourceSummary {
+    pub fn from_tiles(tiles: &[Tile]) -> Self {
+        let mut summary = Self::default();
+        for tile in tiles {
+            if matches!(
+                tile.terrain,
+                TerrainType::Ocean | TerrainType::Lake | TerrainType::River
+            ) {
+                continue;
+            }
+            summary.land_tiles += 1;
+            summary.vegetation += u64::from(tile.resources.vegetation);
+            summary.water += u64::from(tile.resources.water);
+            if tile.resources.vegetation == 0 && tile.resources.water == 0 {
+                summary.depleted_land_tiles += 1;
+            }
+            if tile.resources.water == 0 {
+                summary.dry_land_tiles += 1;
+            }
+        }
+        summary
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Tile {
     pub elevation: i16,
@@ -254,6 +287,15 @@ pub struct WorldStatistics {
     pub births: u64,
     pub deaths: u64,
     pub predation_deaths: u64,
+    #[serde(default)]
+    pub starvation_deaths: u64,
+    #[serde(default)]
+    pub dehydration_deaths: u64,
+    #[serde(default)]
+    pub age_deaths: u64,
+    /// First day for which cause counts are complete; absent in older checkpoints.
+    #[serde(default)]
+    pub death_diagnostics_start_day: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
@@ -329,6 +371,8 @@ pub struct WorldUpdate {
     pub tick: u64,
     pub organisms: Vec<Organism>,
     pub statistics: WorldStatistics,
+    #[serde(default)]
+    pub resource_summary: ResourceSummary,
     pub population_sample: Option<PopulationSample>,
     pub allele_frequency_samples: Vec<AlleleFrequencySample>,
     pub species_lineages: Vec<SpeciesLineage>,
@@ -344,6 +388,7 @@ impl From<&WorldSnapshot> for WorldUpdate {
             tick: snapshot.tick,
             organisms: snapshot.organisms.clone(),
             statistics: snapshot.statistics.clone(),
+            resource_summary: ResourceSummary::from_tiles(&snapshot.tiles),
             population_sample: snapshot
                 .population_history
                 .last()
