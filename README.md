@@ -98,6 +98,14 @@ The result includes the selected mode and birth/death totals. Evaluate repeated 
 
 The benchmark prints JSON containing setup time, ticks per second, population change, births/deaths, peak process RSS, and the final state hash. Throughput includes each tick plus construction of the compact live update and its deterministic state hash. It excludes database checkpoints, HTTP, and browser work. Linux `VmHWM` is used for peak memory; other platforms report `null`. These measurements are a single local baseline, not a capacity guarantee. See [`docs/benchmarks/2026-11-13-baseline.md`](docs/benchmarks/2026-11-13-baseline.md).
 
+The evolutionary stability run advances mechanics versions 1 and 2 to days 1,000, 5,000, and 10,000, checks checkpoint restoration at each point, and reports population, lineage extinctions, allele heterozygosity, speciation rates, throughput, memory, and hashes. Fertility is configurable to examine different growth pressures:
+
+```sh
+cargo run --release -p simlife-bench -- stability 20261113 1 small 20 both
+```
+
+Arguments are seed, founder count, map size, expressed fertility (1–100), and mechanics selection (`1`, `2`, or `both`). For a recorded run and its limitations, see [`docs/benchmarks/2026-11-13-evolutionary-stability.md`](docs/benchmarks/2026-11-13-evolutionary-stability.md).
+
 The simulation records population, diet counts, average expressed speed/metabolism/fertility, and cumulative births/deaths every 10 days. The rolling history holds up to 20,000 samples (200,000 simulated days); checkpoints preserve it. The browser plots total population and population by diet. World listing returns compact summaries; selecting a world fetches its full map and history.
 
 ## Evolutionary observability

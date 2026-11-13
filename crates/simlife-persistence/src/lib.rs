@@ -246,5 +246,70 @@ mod tests {
             .execute(&store.pool)
             .await
             .unwrap();
+
+        for mechanics_version in [
+            simlife_engine::LEGACY_MECHANICS_VERSION,
+            simlife_engine::CURRENT_MECHANICS_VERSION,
+        ] {
+            let mut versioned = World::new_with_mechanics(
+                WorldId::new(),
+                WorldConfig {
+                    name: format!("replay-v{mechanics_version}"),
+                    seed: 700 + u64::from(mechanics_version),
+                    size: simlife_domain::WorldSize::Small,
+                    tick_duration_ms: 1000,
+                },
+                mechanics_version,
+            )
+            .unwrap();
+            let initial = versioned.snapshot();
+            store.create_world(&initial).await.unwrap();
+            store.checkpoint(&initial).await.unwrap();
+            for command in [
+                SimulationCommand::Start,
+                SimulationCommand::IntroduceOrganism {
+                    x: 2,
+                    y: 3,
+                    genome: simlife_domain::Genome {
+                        fertility: simlife_domain::Alleles {
+                            first: 100,
+                            second: 100,
+                        },
+                        ..simlife_domain::Genome::default()
+                    },
+                },
+            ] {
+                versioned.apply(command.clone()).unwrap();
+                let after = versioned.snapshot();
+                store
+                    .record_command(&after, &serde_json::to_string(&command).unwrap())
+                    .await
+                    .unwrap();
+            }
+            let advance = SimulationCommand::Advance { ticks: 40 };
+            versioned.apply(advance.clone()).unwrap();
+            let expected = versioned.snapshot();
+            store
+                .record_command(&expected, &serde_json::to_string(&advance).unwrap())
+                .await
+                .unwrap();
+            store.checkpoint(&expected).await.unwrap();
+            let replayed = store
+                .replay_with_mechanics(expected.id, expected.tick, mechanics_version)
+                .await
+                .unwrap();
+            assert_eq!(replayed.state_hash, expected.state_hash);
+            let recovered = store.recover(expected.id).await.unwrap().unwrap();
+            assert_eq!(recovered.mechanics_version, mechanics_version);
+            assert_eq!(
+                World::restore(&recovered).unwrap().snapshot().state_hash,
+                expected.state_hash
+            );
+            sqlx::query("DELETE FROM worlds WHERE id=$1")
+                .bind(expected.id.0)
+                .execute(&store.pool)
+                .await
+                .unwrap();
+        }
     }
 }

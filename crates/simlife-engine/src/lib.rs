@@ -27,8 +27,8 @@ pub enum EngineError {
     InvalidTransition(RunState),
     #[error("advance count must be between 1 and 100000")]
     InvalidAdvance,
-    #[error("checkpoint state hash does not match its contents")]
-    InvalidCheckpoint,
+    #[error("invalid checkpoint: {0}")]
+    InvalidCheckpoint(&'static str),
     #[error("world coordinates are outside the map")]
     OutOfBounds,
     #[error("world population limit reached")]
@@ -740,12 +740,7 @@ impl World {
             allele_frequency_history: self.allele_frequency_history.clone(),
             organism_lineage: self.organism_lineage.clone(),
             species_lineages: self.species_lineages.clone(),
-            speciation_events: self
-                .speciation_events
-                .iter()
-                .filter(|event| event.day == self.tick)
-                .cloned()
-                .collect(),
+            speciation_events: self.speciation_events.clone(),
             rng_state: self.rng.state(),
             next_organism_id: self.next_organism_id,
             next_species_id: self.next_species_id,
@@ -773,7 +768,12 @@ impl World {
                 .cloned()
                 .collect(),
             species_lineages: self.species_lineages.clone(),
-            speciation_events: self.speciation_events.clone(),
+            speciation_events: self
+                .speciation_events
+                .iter()
+                .filter(|event| event.day == self.tick)
+                .cloned()
+                .collect(),
             state_hash: self.state_hash(),
         }
     }
@@ -851,12 +851,16 @@ impl World {
             || snapshot.height != expected_height
             || snapshot.tiles.len() != usize::from(snapshot.width) * usize::from(snapshot.height)
         {
-            return Err(EngineError::InvalidCheckpoint);
+            return Err(EngineError::InvalidCheckpoint(
+                "world dimensions do not match configuration",
+            ));
         }
         if snapshot.organisms.iter().any(|o| {
             o.x >= snapshot.width || o.y >= snapshot.height || o.genome.validate().is_err()
         }) {
-            return Err(EngineError::InvalidCheckpoint);
+            return Err(EngineError::InvalidCheckpoint(
+                "organism coordinates or genome are invalid",
+            ));
         }
         if snapshot.organism_lineage.len() as u64 + 1 != snapshot.next_organism_id
             || snapshot
@@ -945,7 +949,9 @@ impl World {
                 .enumerate()
                 .any(|(index, event)| event.sequence != index as u64 + 1)
         {
-            return Err(EngineError::InvalidCheckpoint);
+            return Err(EngineError::InvalidCheckpoint(
+                "lineage or speciation history is inconsistent",
+            ));
         }
         if snapshot.allele_frequency_history.len() > MAX_ALLELE_HISTORY_ROWS
             || snapshot.allele_frequency_history.iter().any(|sample| {
@@ -962,7 +968,9 @@ impl World {
                         != u64::from(sample.population) * 2
             })
         {
-            return Err(EngineError::InvalidCheckpoint);
+            return Err(EngineError::InvalidCheckpoint(
+                "allele-frequency history is invalid",
+            ));
         }
         if snapshot.population_history.len() > MAX_POPULATION_SAMPLES
             || snapshot.population_history.iter().any(|sample| {
@@ -982,7 +990,9 @@ impl World {
                 .windows(2)
                 .any(|pair| pair[0].day >= pair[1].day)
         {
-            return Err(EngineError::InvalidCheckpoint);
+            return Err(EngineError::InvalidCheckpoint(
+                "population history is invalid",
+            ));
         }
         let world = Self {
             id: snapshot.id,
@@ -1007,7 +1017,9 @@ impl World {
             next_species_id: snapshot.next_species_id,
         };
         if world.state_hash() != snapshot.state_hash {
-            return Err(EngineError::InvalidCheckpoint);
+            return Err(EngineError::InvalidCheckpoint(
+                "state hash does not match checkpoint contents",
+            ));
         }
         Ok(world)
     }
@@ -1500,6 +1512,12 @@ mod tests {
             .iter()
             .any(|lineage| lineage.species_id == event.new_species_id
                 && lineage.parent_species_id == Some(event.parent_species_id)));
+        a.apply(SimulationCommand::Advance { ticks: 5 }).unwrap();
+        b.apply(SimulationCommand::Advance { ticks: 5 }).unwrap();
+        assert_eq!(
+            a.snapshot().speciation_events,
+            b.snapshot().speciation_events
+        );
         let checkpoint = a.snapshot();
         let mut restored = World::restore(&checkpoint).unwrap();
         assert_eq!(
