@@ -8,7 +8,7 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("{message}");
-            eprintln!("usage: simlife-bench <organisms> [ticks] [seed] [small|medium|large]");
+            eprintln!("usage: simlife-bench <organisms> [ticks] [seed] [small|medium|large] [sterile|reproductive]");
             ExitCode::FAILURE
         }
     }
@@ -25,6 +25,10 @@ fn run() -> Result<(), String> {
         "large" => WorldSize::Large,
         _ => return Err("map size must be small, medium, or large".into()),
     };
+    let mode = args.next().unwrap_or_else(|| "sterile".into());
+    if !matches!(mode.as_str(), "sterile" | "reproductive") {
+        return Err("benchmark mode must be sterile or reproductive".into());
+    }
     if args.next().is_some()
         || !(1..=100_000).contains(&population)
         || !(1..=100_000).contains(&ticks)
@@ -51,8 +55,8 @@ fn run() -> Result<(), String> {
             second: 2,
         },
         fertility: Alleles {
-            first: 0,
-            second: 0,
+            first: if mode == "reproductive" { 100 } else { 0 },
+            second: if mode == "reproductive" { 100 } else { 0 },
         },
         ..Genome::default()
     };
@@ -84,6 +88,7 @@ fn run() -> Result<(), String> {
             "world_size": format!("{:?}", size).to_lowercase(),
             "dimensions": [final_state.width, final_state.height],
             "initial_population": population,
+            "mode": mode,
             "final_population": final_state.population,
             "population_change_percent": population_change_percent,
             "ticks": ticks,

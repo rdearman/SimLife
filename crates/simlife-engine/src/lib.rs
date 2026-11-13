@@ -1,9 +1,9 @@
 use blake3::Hasher;
 use serde::Serialize;
 use simlife_domain::{
-    Alleles, Diet, Genome, Organism, PopulationSample, Resources, RunState, Sex, SimulationCommand,
-    TerrainType, Tile, WorldConfig, WorldId, WorldSnapshot, WorldStatistics, WorldSummary,
-    WorldUpdate,
+    AlleleFrequencySample, Alleles, Diet, Genome, Organism, OrganismInspection, OrganismLineage,
+    PopulationSample, Resources, RunState, Sex, SimulationCommand, SpeciesLineage, TerrainType,
+    Tile, WorldConfig, WorldId, WorldSnapshot, WorldStatistics, WorldSummary, WorldUpdate,
 };
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
@@ -11,6 +11,8 @@ use thiserror::Error;
 const MAX_ORGANISMS: usize = 100_000;
 const POPULATION_SAMPLE_EVERY_DAYS: u64 = 10;
 const MAX_POPULATION_SAMPLES: usize = 20_000;
+const MAX_ALLELE_HISTORY_ROWS: usize = 100_000;
+const MAX_ALLELE_SPECIES_PER_SAMPLE: usize = 32;
 const INITIAL_ENERGY: u32 = 100;
 const INITIAL_WATER: u32 = 30;
 
@@ -76,6 +78,9 @@ pub struct World {
     organisms: Vec<Organism>,
     statistics: WorldStatistics,
     population_history: Vec<PopulationSample>,
+    allele_frequency_history: Vec<AlleleFrequencySample>,
+    organism_lineage: Vec<OrganismLineage>,
+    species_lineages: Vec<SpeciesLineage>,
     rng: DeterministicRng,
     next_organism_id: u64,
 }
@@ -97,10 +102,14 @@ impl World {
             organisms: Vec::new(),
             statistics: WorldStatistics::default(),
             population_history: Vec::new(),
+            allele_frequency_history: Vec::new(),
+            organism_lineage: Vec::new(),
+            species_lineages: Vec::new(),
             rng,
             next_organism_id: 1,
         };
         world.sample_population();
+        world.sample_allele_frequencies();
         Ok(world)
     }
 
@@ -169,6 +178,7 @@ impl World {
         self.organisms.push(Organism {
             id,
             species_id,
+            parent_ids: Vec::new(),
             x,
             y,
             age_days: 0,
@@ -176,8 +186,11 @@ impl World {
             water_reserve: INITIAL_WATER,
             genome,
         });
+        let founder_genome = self.organisms.last().expect("just inserted").genome.clone();
+        self.register_founder(id, species_id, founder_genome);
         if self.tick.is_multiple_of(POPULATION_SAMPLE_EVERY_DAYS) {
             self.sample_population();
+            self.sample_allele_frequencies();
         }
         Ok(())
     }
@@ -198,6 +211,7 @@ impl World {
             self.organisms.push(Organism {
                 id,
                 species_id,
+                parent_ids: Vec::new(),
                 x: self.rng.below(u64::from(self.width)) as u16,
                 y: self.rng.below(u64::from(self.height)) as u16,
                 age_days: 0,
@@ -205,8 +219,10 @@ impl World {
                 water_reserve: INITIAL_WATER,
                 genome: genome.clone(),
             });
+            self.register_founder(id, species_id, genome.clone());
         }
         self.sample_population();
+        self.sample_allele_frequencies();
         Ok(())
     }
 
@@ -220,7 +236,32 @@ impl World {
         self.reproduce();
         if self.tick.is_multiple_of(POPULATION_SAMPLE_EVERY_DAYS) {
             self.sample_population();
+            self.sample_allele_frequencies();
         }
+    }
+
+    fn register_founder(&mut self, id: u64, species_id: u64, genome: Genome) {
+        if !self
+            .species_lineages
+            .iter()
+            .any(|lineage| lineage.species_id == species_id)
+        {
+            self.species_lineages.push(SpeciesLineage {
+                species_id,
+                parent_species_id: None,
+                founder_organism_id: id,
+                founded_day: self.tick,
+                extinct_day: None,
+            });
+        }
+        self.organism_lineage.push(OrganismLineage {
+            organism_id: id,
+            parent_ids: Vec::new(),
+            species_id,
+            born_day: self.tick,
+            died_day: None,
+            genome_at_birth: genome,
+        });
     }
 
     fn sample_population(&mut self) {
@@ -260,6 +301,49 @@ impl World {
         self.population_history.push(sample);
         if self.population_history.len() > MAX_POPULATION_SAMPLES {
             self.population_history.drain(..MAX_POPULATION_SAMPLES / 10);
+        }
+    }
+
+    fn sample_allele_frequencies(&mut self) {
+        let mut by_species: HashMap<u64, AlleleFrequencySample> = HashMap::new();
+        for organism in &self.organisms {
+            if !by_species.contains_key(&organism.species_id)
+                && by_species.len() >= MAX_ALLELE_SPECIES_PER_SAMPLE
+            {
+                continue;
+            }
+            let sample =
+                by_species
+                    .entry(organism.species_id)
+                    .or_insert_with(|| AlleleFrequencySample {
+                        day: self.tick,
+                        species_id: organism.species_id,
+                        population: 0,
+                        speed: vec![0; 5],
+                        metabolism: vec![0; 21],
+                        fertility: vec![0; 101],
+                    });
+            sample.population += 1;
+            sample.speed[usize::from(organism.genome.speed.first)] += 1;
+            sample.speed[usize::from(organism.genome.speed.second)] += 1;
+            sample.metabolism[usize::from(organism.genome.metabolism.first)] += 1;
+            sample.metabolism[usize::from(organism.genome.metabolism.second)] += 1;
+            sample.fertility[usize::from(organism.genome.fertility.first)] += 1;
+            sample.fertility[usize::from(organism.genome.fertility.second)] += 1;
+        }
+        self.allele_frequency_history
+            .retain(|sample| sample.day != self.tick);
+        let mut samples: Vec<_> = by_species.into_values().collect();
+        samples.sort_by_key(|sample| sample.species_id);
+        self.allele_frequency_history.extend(samples);
+        if self.allele_frequency_history.len() > MAX_ALLELE_HISTORY_ROWS {
+            let oldest_day = self
+                .allele_frequency_history
+                .first()
+                .map(|sample| sample.day)
+                .unwrap_or(0);
+            self.allele_frequency_history
+                .retain(|sample| sample.day != oldest_day);
         }
     }
 
@@ -359,6 +443,9 @@ impl World {
             }
         }
         if !killed.is_empty() {
+            for organism_id in &killed {
+                self.record_death(*organism_id);
+            }
             self.organisms.retain(|o| !killed.contains(&o.id));
             let deaths = killed.len() as u64;
             self.statistics.deaths += deaths;
@@ -367,10 +454,36 @@ impl World {
     }
 
     fn resolve_deaths(&mut self) {
+        let dead_ids: Vec<_> = self
+            .organisms
+            .iter()
+            .filter(|o| {
+                o.energy == 0 || o.water_reserve == 0 || o.age_days >= o.genome.lifespan_days
+            })
+            .map(|o| o.id)
+            .collect();
+        for organism_id in dead_ids {
+            self.record_death(organism_id);
+        }
         let old_len = self.organisms.len();
         self.organisms
             .retain(|o| o.energy > 0 && o.water_reserve > 0 && o.age_days < o.genome.lifespan_days);
         self.statistics.deaths += (old_len - self.organisms.len()) as u64;
+        let living_species: HashSet<_> = self.organisms.iter().map(|o| o.species_id).collect();
+        for lineage in &mut self.species_lineages {
+            if lineage.extinct_day.is_none() && !living_species.contains(&lineage.species_id) {
+                lineage.extinct_day = Some(self.tick);
+            }
+        }
+    }
+
+    fn record_death(&mut self, organism_id: u64) {
+        if let Some(record) = organism_id
+            .checked_sub(1)
+            .and_then(|index| self.organism_lineage.get_mut(index as usize))
+        {
+            record.died_day = Some(self.tick);
+        }
     }
 
     fn reproduce(&mut self) {
@@ -429,10 +542,23 @@ impl World {
             let mut child = parent.clone();
             child.id = id;
             child.genome = genome;
+            child.parent_ids = if let Some(ref mate) = other {
+                vec![parent.id, mate.id]
+            } else {
+                vec![parent.id]
+            };
             child.age_days = 0;
             child.energy = 50;
             child.water_reserve = INITIAL_WATER;
             self.organisms[i].energy -= 25;
+            self.organism_lineage.push(OrganismLineage {
+                organism_id: id,
+                parent_ids: child.parent_ids.clone(),
+                species_id: child.species_id,
+                born_day: self.tick,
+                died_day: None,
+                genome_at_birth: child.genome.clone(),
+            });
             newborns.push(child);
         }
         self.statistics.births += newborns.len() as u64;
@@ -452,6 +578,9 @@ impl World {
             organisms: self.organisms.clone(),
             statistics: self.statistics.clone(),
             population_history: self.population_history.clone(),
+            allele_frequency_history: self.allele_frequency_history.clone(),
+            organism_lineage: self.organism_lineage.clone(),
+            species_lineages: self.species_lineages.clone(),
             rng_state: self.rng.state(),
             next_organism_id: self.next_organism_id,
             state_hash,
@@ -471,6 +600,13 @@ impl World {
                 .last()
                 .filter(|sample| sample.day == self.tick)
                 .cloned(),
+            allele_frequency_samples: self
+                .allele_frequency_history
+                .iter()
+                .filter(|sample| sample.day == self.tick)
+                .cloned()
+                .collect(),
+            species_lineages: self.species_lineages.clone(),
             state_hash: self.state_hash(),
         }
     }
@@ -497,6 +633,8 @@ impl World {
             height: u16,
             tiles: &'a [Tile],
             organisms: &'a [Organism],
+            organism_lineage: &'a [OrganismLineage],
+            species_lineages: &'a [SpeciesLineage],
             statistics: &'a WorldStatistics,
             rng_state: u64,
             next_organism_id: u64,
@@ -507,6 +645,8 @@ impl World {
             height: self.height,
             tiles: &self.tiles,
             organisms: &self.organisms,
+            organism_lineage: &self.organism_lineage,
+            species_lineages: &self.species_lineages,
             statistics: &self.statistics,
             rng_state: self.rng.state(),
             next_organism_id: self.next_organism_id,
@@ -514,7 +654,7 @@ impl World {
         let bytes = serde_json::to_vec(&state).expect("canonical state serializes");
         let mut hasher = Hasher::new();
         // Population history is derived telemetry, not authoritative simulation state.
-        hasher.update(b"simlife-world-state-v2\0");
+        hasher.update(b"simlife-world-state-v3\0");
         hasher.update(&bytes);
         hasher.finalize().to_hex().to_string()
     }
@@ -534,6 +674,64 @@ impl World {
         if snapshot.organisms.iter().any(|o| {
             o.x >= snapshot.width || o.y >= snapshot.height || o.genome.validate().is_err()
         }) {
+            return Err(EngineError::InvalidCheckpoint);
+        }
+        if snapshot.organism_lineage.len() as u64 + 1 != snapshot.next_organism_id
+            || snapshot
+                .organism_lineage
+                .iter()
+                .enumerate()
+                .any(|(index, record)| {
+                    record.organism_id != index as u64 + 1
+                        || record
+                            .parent_ids
+                            .iter()
+                            .any(|parent| *parent >= record.organism_id)
+                        || (record.parent_ids.len() > 2)
+                })
+            || snapshot.organism_lineage.iter().any(|record| {
+                record.organism_id == 0
+                    || record.organism_id >= snapshot.next_organism_id
+                    || record.born_day > snapshot.tick
+                    || record
+                        .died_day
+                        .is_some_and(|day| day < record.born_day || day > snapshot.tick)
+                    || record
+                        .parent_ids
+                        .iter()
+                        .any(|parent| *parent >= record.organism_id)
+                    || record.genome_at_birth.validate().is_err()
+            })
+            || snapshot.organisms.iter().any(|organism| {
+                !snapshot
+                    .organism_lineage
+                    .iter()
+                    .any(|record| record.organism_id == organism.id && record.died_day.is_none())
+            })
+            || snapshot.species_lineages.iter().any(|lineage| {
+                lineage.founded_day > snapshot.tick
+                    || lineage
+                        .extinct_day
+                        .is_some_and(|day| day < lineage.founded_day || day > snapshot.tick)
+            })
+        {
+            return Err(EngineError::InvalidCheckpoint);
+        }
+        if snapshot.allele_frequency_history.len() > MAX_ALLELE_HISTORY_ROWS
+            || snapshot.allele_frequency_history.iter().any(|sample| {
+                sample.day > snapshot.tick
+                    || sample.population == 0
+                    || sample.speed.len() != 5
+                    || sample.metabolism.len() != 21
+                    || sample.fertility.len() != 101
+                    || sample.speed.iter().map(|n| u64::from(*n)).sum::<u64>()
+                        != u64::from(sample.population) * 2
+                    || sample.metabolism.iter().map(|n| u64::from(*n)).sum::<u64>()
+                        != u64::from(sample.population) * 2
+                    || sample.fertility.iter().map(|n| u64::from(*n)).sum::<u64>()
+                        != u64::from(sample.population) * 2
+            })
+        {
             return Err(EngineError::InvalidCheckpoint);
         }
         if snapshot.population_history.len() > MAX_POPULATION_SAMPLES
@@ -567,6 +765,9 @@ impl World {
             organisms: snapshot.organisms.clone(),
             statistics: snapshot.statistics.clone(),
             population_history: snapshot.population_history.clone(),
+            allele_frequency_history: snapshot.allele_frequency_history.clone(),
+            organism_lineage: snapshot.organism_lineage.clone(),
+            species_lineages: snapshot.species_lineages.clone(),
             rng: DeterministicRng {
                 state: snapshot.rng_state,
             },
@@ -586,6 +787,43 @@ impl World {
     }
     pub fn is_running(&self) -> bool {
         self.state == RunState::Running
+    }
+
+    pub fn inspect_organism(&self, id: u64, max_ancestors: usize) -> Option<OrganismInspection> {
+        let organism = self
+            .organisms
+            .iter()
+            .find(|organism| organism.id == id)?
+            .clone();
+        let lineage = self
+            .organism_lineage
+            .iter()
+            .find(|record| record.organism_id == id)?
+            .clone();
+        let mut ancestry = Vec::new();
+        let mut parent = lineage.parent_ids.first().copied();
+        while let Some(parent_id) = parent.filter(|_| ancestry.len() < max_ancestors) {
+            let Some(record) = self
+                .organism_lineage
+                .iter()
+                .find(|r| r.organism_id == parent_id)
+            else {
+                break;
+            };
+            ancestry.push(record.clone());
+            parent = record.parent_ids.first().copied();
+        }
+        Some(OrganismInspection {
+            organism,
+            lineage,
+            offspring_ids: self
+                .organism_lineage
+                .iter()
+                .filter(|record| record.parent_ids.contains(&id))
+                .map(|record| record.organism_id)
+                .collect(),
+            ancestry,
+        })
     }
 }
 
@@ -806,6 +1044,7 @@ mod tests {
             .unwrap();
         assert!(world.organisms.is_empty());
         assert_eq!(world.statistics.deaths, 1);
+        assert_eq!(world.organism_lineage[0].died_day, Some(1));
     }
 
     #[test]
@@ -881,6 +1120,22 @@ mod tests {
             .unwrap();
         assert!(world.statistics.births >= 1);
         assert!(world.organisms.len() > 1);
+        let child = world
+            .organisms
+            .iter()
+            .find(|organism| organism.id > 1)
+            .unwrap();
+        assert_eq!(child.parent_ids.len(), 1);
+        let inspection = world.inspect_organism(child.id, 10).unwrap();
+        assert_eq!(inspection.ancestry.len(), 1);
+        assert_eq!(inspection.ancestry[0].organism_id, child.parent_ids[0]);
+        let parent = world.inspect_organism(child.parent_ids[0], 10).unwrap();
+        assert!(parent.offspring_ids.contains(&child.id));
+        let recovered = World::restore(&world.snapshot()).unwrap();
+        assert_eq!(
+            recovered.snapshot().organism_lineage,
+            world.snapshot().organism_lineage
+        );
     }
 
     #[test]
@@ -967,5 +1222,72 @@ mod tests {
         assert_eq!(sample.day, 10);
         assert_eq!(sample.population as usize, snapshot.organisms.len());
         assert_eq!(sample.average_speed, 3);
+        let allele_sample = snapshot
+            .allele_frequency_history
+            .iter()
+            .find(|sample| sample.day == 10)
+            .unwrap();
+        assert_eq!(
+            allele_sample.population as usize,
+            snapshot
+                .organisms
+                .iter()
+                .filter(|o| o.species_id == allele_sample.species_id)
+                .count()
+        );
+        assert_eq!(allele_sample.speed[3], allele_sample.population * 2);
+        assert_eq!(snapshot.species_lineages.len(), 1);
+        assert_eq!(snapshot.organism_lineage.len(), 100);
+    }
+
+    #[test]
+    fn checkpoint_preserves_ancestry_and_allele_frequencies() {
+        let mut world = World::new(WorldId::new(), config(9801)).unwrap();
+        world.seed_population(8, Genome::default()).unwrap();
+        world.apply(SimulationCommand::Start).unwrap();
+        world
+            .apply(SimulationCommand::Advance { ticks: 10 })
+            .unwrap();
+        let snapshot = world.snapshot();
+        let restored = World::restore(&snapshot).unwrap();
+        assert_eq!(restored.snapshot().state_hash, snapshot.state_hash);
+        assert_eq!(
+            restored.snapshot().organism_lineage,
+            snapshot.organism_lineage
+        );
+        assert_eq!(
+            restored.snapshot().allele_frequency_history,
+            snapshot.allele_frequency_history
+        );
+    }
+
+    #[test]
+    fn reproduction_and_lineage_are_deterministic_for_identical_seeds() {
+        let mut first = World::new(WorldId::new(), config(9802)).unwrap();
+        let mut second = World::new(WorldId::new(), config(9802)).unwrap();
+        let genome = Genome {
+            speed: Alleles {
+                first: 0,
+                second: 0,
+            },
+            fertility: Alleles {
+                first: 100,
+                second: 100,
+            },
+            ..Genome::default()
+        };
+        for world in [&mut first, &mut second] {
+            world.seed_population(24, genome.clone()).unwrap();
+            world.apply(SimulationCommand::Start).unwrap();
+            world
+                .apply(SimulationCommand::Advance { ticks: 60 })
+                .unwrap();
+        }
+        assert!(first.statistics.births > 0);
+        assert_eq!(first.snapshot().state_hash, second.snapshot().state_hash);
+        assert_eq!(
+            first.snapshot().organism_lineage,
+            second.snapshot().organism_lineage
+        );
     }
 }

@@ -184,12 +184,57 @@ impl Genome {
 pub struct Organism {
     pub id: u64,
     pub species_id: u64,
+    /// Parent organism IDs in stable order; empty for introduced founders.
+    #[serde(default)]
+    pub parent_ids: Vec<u64>,
     pub x: u16,
     pub y: u16,
     pub age_days: u16,
     pub energy: u32,
     pub water_reserve: u32,
     pub genome: Genome,
+}
+
+/// Permanent birth/death and ancestry record. Retained after an organism dies.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OrganismLineage {
+    pub organism_id: u64,
+    pub parent_ids: Vec<u64>,
+    pub species_id: u64,
+    pub born_day: u64,
+    pub died_day: Option<u64>,
+    pub genome_at_birth: Genome,
+}
+
+/// World-local species identity. M1–M6 do not implement speciation; records identify
+/// the founder lineage and when a currently empty lineage became extinct.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SpeciesLineage {
+    pub species_id: u64,
+    pub parent_species_id: Option<u64>,
+    pub founder_organism_id: u64,
+    pub founded_day: u64,
+    pub extinct_day: Option<u64>,
+}
+
+/// Copies of each allele value in a sampled species population (two copies per organism).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AlleleFrequencySample {
+    pub day: u64,
+    pub species_id: u64,
+    pub population: u32,
+    pub speed: Vec<u32>,
+    pub metabolism: Vec<u32>,
+    pub fertility: Vec<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OrganismInspection {
+    pub organism: Organism,
+    pub lineage: OrganismLineage,
+    pub offspring_ids: Vec<u64>,
+    /// Nearest ancestors first, following the first recorded parent at each generation.
+    pub ancestry: Vec<OrganismLineage>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
@@ -239,6 +284,12 @@ pub struct WorldSnapshot {
     pub statistics: WorldStatistics,
     #[serde(default)]
     pub population_history: Vec<PopulationSample>,
+    #[serde(default)]
+    pub allele_frequency_history: Vec<AlleleFrequencySample>,
+    #[serde(default)]
+    pub organism_lineage: Vec<OrganismLineage>,
+    #[serde(default)]
+    pub species_lineages: Vec<SpeciesLineage>,
     pub rng_state: u64,
     pub next_organism_id: u64,
     pub state_hash: String,
@@ -254,6 +305,8 @@ pub struct WorldUpdate {
     pub organisms: Vec<Organism>,
     pub statistics: WorldStatistics,
     pub population_sample: Option<PopulationSample>,
+    pub allele_frequency_samples: Vec<AlleleFrequencySample>,
+    pub species_lineages: Vec<SpeciesLineage>,
     pub state_hash: String,
 }
 impl From<&WorldSnapshot> for WorldUpdate {
@@ -271,6 +324,13 @@ impl From<&WorldSnapshot> for WorldUpdate {
                 .filter(|sample| sample.day == snapshot.tick)
                 .cloned(),
             state_hash: snapshot.state_hash.clone(),
+            allele_frequency_samples: snapshot
+                .allele_frequency_history
+                .iter()
+                .filter(|sample| sample.day == snapshot.tick)
+                .cloned()
+                .collect(),
+            species_lineages: snapshot.species_lineages.clone(),
         }
     }
 }

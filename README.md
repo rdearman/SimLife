@@ -21,8 +21,8 @@ The mechanics specification labels detailed formulas as proposals. These M2–M6
 - Organisms have diploid integer alleles for speed, metabolism, and fertility, plus diet, sex, and lifespan. Movement chooses a seeded random neighboring direction per movement point. Metabolism and water use are paid daily; herbivores consume vegetation; starvation, dehydration, and lifespan cause death.
 - Founder organisms with matching genomes apart from sex share a species lineage, so separately introduced compatible females and males can reproduce; offspring retain their parental lineage.
 - Carnivores attack co-located non-carnivores. Organisms meeting the configured fertility threshold reproduce asexually, or sexually when a same-species opposite-sex mate shares their tile. Each inherited allele is selected from a parent and may mutate by one integer step with a fixed 1% chance. Mutations and births use the same saved random stream.
-- The single-threaded engine orders organisms by stable ID and uses integer arithmetic. The canonical state hash includes terrain, resources, organisms, counters, and random state, but excludes the world UUID and display name; identical seeds therefore generate the same initial world and produce equal states under equal commands.
-- The server starts an independent clock task for each running world. State stays in memory between checkpoints. Checkpoints are written at creation, after accepted commands, and every 100 simulated days, not on every tick. Startup restores the newest checkpoint for each world.
+- The single-threaded engine orders organisms by stable ID and uses integer arithmetic. The canonical state hash includes terrain, resources, organisms, ancestry, lineage records, counters, and random state, but excludes the world UUID and display name; identical seeds therefore generate equal states under equal commands.
+- The server starts an independent clock task for each running world. State stays in memory between checkpoints. Checkpoints are written at creation, after accepted commands, and every 100 simulated days, not on every tick. Startup restores the newest checkpoint for each world; if an older pre-lineage checkpoint fails the new hash format, it replays command history and stores a current-format checkpoint.
 
 The M5 client lists/creates worlds, selects map size and tick interval, displays terrain and organisms, reports status/day/population/births/deaths, receives WebSocket changes, starts/pauses/resumes worlds, advances a day, and introduces a configured founder organism on a selected tile. It plots rolling total and diet-specific population history. Map color and red organism markers are presentation only.
 
@@ -87,9 +87,24 @@ cargo build -p simlife-bench --release
 ./target/release/simlife-bench 100000 100 20261113 large
 ```
 
+Enable reproduction by adding `reproductive` after the map size. This uses asexual founders with fertility alleles set to 100 and the deterministic reproduction and mutation rules used by the engine:
+
+```sh
+./target/release/simlife-bench 1000 500 20261113 medium reproductive
+./target/release/simlife-bench 10000 500 20261113 large reproductive
+```
+
+The result includes the selected mode and birth/death totals. Evaluate repeated seeds and population trajectories before drawing conclusions about sustainable carrying capacity. One local reproductive/sterile comparison is recorded in [`docs/benchmarks/2026-11-13-reproductive-observability.md`](docs/benchmarks/2026-11-13-reproductive-observability.md).
+
 The benchmark prints JSON containing setup time, ticks per second, population change, births/deaths, peak process RSS, and the final state hash. Throughput includes each tick plus construction of the compact live update and its deterministic state hash. It excludes database checkpoints, HTTP, and browser work. Linux `VmHWM` is used for peak memory; other platforms report `null`. These measurements are a single local baseline, not a capacity guarantee. See [`docs/benchmarks/2026-11-13-baseline.md`](docs/benchmarks/2026-11-13-baseline.md).
 
 The simulation records population, diet counts, average expressed speed/metabolism/fertility, and cumulative births/deaths every 10 days. The rolling history holds up to 20,000 samples (200,000 simulated days); checkpoints preserve it. The browser plots total population and population by diet. World listing returns compact summaries; selecting a world fetches its full map and history.
+
+## Evolutionary observability
+
+Every organism has a stable world-local ID and permanent lineage record with parent IDs, birth day, birth genome, species-lineage ID, and death day when applicable. Introduced organisms are founders without parents. Individual inspection reports both parents and offspring, and ancestry follows the first parent branch, nearest ancestor first; the API caps requested depth at 100. Click an organism on the map to inspect its current variables, genome, parents, offspring and ancestry. Inspect with `GET /api/v1/worlds/{world_id}/organisms/{organism_id}?ancestors=10`.
+
+World snapshots store per-species allele copy counts for speed (0–4), metabolism (0–20), and fertility (0–100), sampled every 10 days. Each vector index is an allele value and each count is the number of copies, so the sum is twice the sampled population. To bound memory, a sample tracks at most 32 lineages in stable ID order and the history retains at most 100,000 lineage-sample rows. Samples are included in snapshots and checkpoints. `species_lineages` records founder identity and extinction day. Species identity remains the current simple genome grouping inherited by offspring; automatic speciation and reproductive-isolation rules are still outstanding. These tracking definitions are implementation choices, not approved biological formulas from the working mechanics proposal.
 
 ## API
 
@@ -99,6 +114,7 @@ All routes are versioned under `/api/v1`:
 - `GET /worlds`
 - `POST /worlds` with `{ "name": "Earth", "seed": 42, "size": "small", "tick_duration_ms": 1000 }`
 - `GET /worlds/{id}`
+- `GET /worlds/{id}/organisms/{organism_id}?ancestors=10`
 - `GET /worlds/{id}/replay` (rebuild from seed and command history through the live tick; returns a hash match flag)
 - `POST /worlds/{id}/commands` with `{"command":"start"}`, `pause`, `resume`, `{"command":"advance","ticks":1}`, `{"command":"set_speed","tick_duration_ms":500}`, or `{"command":"introduce_organism","x":2,"y":4,"genome":{...}}`
 - `GET /worlds/{id}/stream` (initial full snapshot followed by compact world updates)
@@ -107,4 +123,4 @@ World configuration requires a non-empty name, non-zero 64-bit seed, and tick in
 
 ## Current limits
 
-This implementation provides a first playable individual-organism ecology, not every Phase 1 proposal. The hybrid aggregate population model, richer environmental/weather systems, robust species lineage/speciation, sophisticated multi-step predation, genome editing, multi-player accounts, and production authentication are not implemented. Population is capped at 100,000 organisms per world. Replay currently starts from the original seed and walks accepted command history, so replay cost grows with world age; it is intended as a verification/recovery foundation while checkpoints provide fast restart recovery. The reproducibility guarantee targets supported Rust platforms with the current versioned integer rules; changing simulation algorithms requires a state-hash/version migration. PostgreSQL migration/recovery and network WebSocket integration tests require a reachable disposable database via `DATABASE_URL`; without one, those tests exit early and must be reported as skipped, not as database verification.
+This implementation provides a first playable individual-organism ecology, not every Phase 1 proposal. The hybrid aggregate population model, richer environmental/weather systems, automatic speciation/reproductive isolation, sophisticated multi-step predation, genome editing, multi-player accounts, and production authentication are not implemented. Population is capped at 100,000 organisms per world. Permanent ancestry records increase memory use with every birth and currently have no pruning policy. Replay currently starts from the original seed and walks accepted command history, so replay cost grows with world age; it is intended as a verification/recovery foundation while checkpoints provide fast restart recovery. The reproducibility guarantee targets supported Rust platforms with the current versioned integer rules; changing simulation algorithms requires a state-hash/version migration. PostgreSQL migration/recovery and network WebSocket integration tests require a reachable disposable database via `DATABASE_URL`; without one, those tests exit early and must be reported as skipped, not as database verification.

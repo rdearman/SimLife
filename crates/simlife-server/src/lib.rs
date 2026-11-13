@@ -1,7 +1,7 @@
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, State,
+        Path, Query, State,
     },
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -30,17 +30,19 @@ struct AppState {
 }
 pub async fn app(store: Store) -> Result<Router, Box<dyn std::error::Error + Send + Sync>> {
     let (updates, _) = broadcast::channel(256);
-    let recovered = store
-        .recover_all()
-        .await?
-        .into_iter()
-        .map(|snapshot| {
-            Ok((
-                snapshot.id,
-                Arc::new(Mutex::new(World::restore(&snapshot)?)),
-            ))
-        })
-        .collect::<Result<HashMap<_, _>, simlife_engine::EngineError>>()?;
+    let mut recovered = HashMap::new();
+    for snapshot in store.recover_all().await? {
+        let world = match World::restore(&snapshot) {
+            Ok(world) => world,
+            Err(checkpoint_error) => {
+                tracing::warn!(world_id = %snapshot.id.0, tick = snapshot.tick, %checkpoint_error, "checkpoint restore failed; attempting deterministic command-history recovery");
+                let replayed = store.replay(snapshot.id, snapshot.tick).await?;
+                store.checkpoint(&replayed).await?;
+                World::restore(&replayed)?
+            }
+        };
+        recovered.insert(snapshot.id, Arc::new(Mutex::new(world)));
+    }
     let state = AppState {
         worlds: Arc::new(Mutex::new(recovered)),
         updates,
@@ -57,6 +59,10 @@ pub async fn app(store: Store) -> Result<Router, Box<dyn std::error::Error + Sen
         )
         .route("/api/v1/worlds", get(list_worlds).post(create_world))
         .route("/api/v1/worlds/:id", get(get_world))
+        .route(
+            "/api/v1/worlds/:id/organisms/:organism_id",
+            get(inspect_organism),
+        )
         .route("/api/v1/worlds/:id/replay", get(replay_world))
         .route("/api/v1/worlds/:id/commands", post(command))
         .route("/api/v1/worlds/:id/stream", get(websocket))
@@ -172,6 +178,49 @@ async fn get_world(
     let snapshot = world.lock().await.snapshot();
     Ok(Json(snapshot))
 }
+#[derive(serde::Deserialize)]
+struct InspectionQuery {
+    #[serde(default = "default_ancestry_depth")]
+    ancestors: usize,
+}
+fn default_ancestry_depth() -> usize {
+    10
+}
+async fn inspect_organism(
+    State(s): State<AppState>,
+    Path((raw_id, organism_id)): Path<(String, String)>,
+    Query(query): Query<InspectionQuery>,
+) -> Result<Json<simlife_domain::OrganismInspection>, ApiError> {
+    let ancestry_depth = validate_ancestry_depth(query.ancestors)?;
+    let id = parse_id(&raw_id)?;
+    let organism_id = parse_organism_id(&organism_id)?;
+    let world = s
+        .worlds
+        .lock()
+        .await
+        .get(&id)
+        .cloned()
+        .ok_or_else(ApiError::not_found)?;
+    let inspected = world
+        .lock()
+        .await
+        .inspect_organism(organism_id, ancestry_depth)
+        .ok_or_else(ApiError::not_found)?;
+    Ok(Json(inspected))
+}
+fn parse_organism_id(raw: &str) -> Result<u64, ApiError> {
+    raw.parse::<u64>()
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| ApiError::bad_request("invalid organism id"))
+}
+fn validate_ancestry_depth(depth: usize) -> Result<usize, ApiError> {
+    if depth > 100 {
+        Err(ApiError::bad_request("ancestors must be between 0 and 100"))
+    } else {
+        Ok(depth)
+    }
+}
 async fn replay_world(
     State(s): State<AppState>,
     Path(id): Path<String>,
@@ -270,6 +319,7 @@ fn parse_id(raw: &str) -> Result<WorldId, ApiError> {
         .map_err(|_| ApiError::bad_request("invalid world id"))
 }
 
+#[derive(Debug)]
 struct ApiError(StatusCode, String);
 impl ApiError {
     fn bad_request(e: impl ToString) -> Self {
@@ -319,6 +369,15 @@ mod tests {
     #[test]
     fn rejects_malformed_world_id() {
         assert!(parse_id("nope").is_err());
+    }
+
+    #[test]
+    fn organism_inspection_id_validation_rejects_zero_and_non_numeric_values() {
+        assert_eq!(parse_organism_id("17").unwrap(), 17);
+        assert!(parse_organism_id("0").is_err());
+        assert!(parse_organism_id("abc").is_err());
+        assert_eq!(validate_ancestry_depth(100).unwrap(), 100);
+        assert!(validate_ancestry_depth(101).is_err());
     }
 
     #[test]
