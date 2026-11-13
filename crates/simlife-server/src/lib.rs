@@ -8,37 +8,48 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use simlife_domain::{SimulationCommand, WorldConfig, WorldId, WorldSnapshot};
+use simlife_domain::{
+    SimulationCommand, WorldConfig, WorldId, WorldSize, WorldSnapshot, WorldUpdate,
+};
 use simlife_engine::{EngineError, World};
 use simlife_persistence::Store;
+use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::{broadcast, Mutex};
+use tokio::{
+    sync::{broadcast, Mutex},
+    time::sleep,
+};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use uuid::Uuid;
 
 #[derive(Clone)]
 struct AppState {
     worlds: Arc<Mutex<HashMap<WorldId, Arc<Mutex<World>>>>>,
-    updates: broadcast::Sender<WorldSnapshot>,
+    updates: broadcast::Sender<WorldUpdate>,
     store: Arc<Store>,
 }
-pub async fn app(store: Store) -> Result<Router, sqlx::Error> {
+pub async fn app(store: Store) -> Result<Router, Box<dyn std::error::Error + Send + Sync>> {
     let (updates, _) = broadcast::channel(256);
     let recovered = store
         .recover_all()
         .await?
         .into_iter()
-        .filter_map(|snapshot| {
-            World::restore(&snapshot)
-                .ok()
-                .map(|world| (snapshot.id, Arc::new(Mutex::new(world))))
+        .map(|snapshot| {
+            Ok((
+                snapshot.id,
+                Arc::new(Mutex::new(World::restore(&snapshot)?)),
+            ))
         })
-        .collect();
+        .collect::<Result<HashMap<_, _>, simlife_engine::EngineError>>()?;
     let state = AppState {
         worlds: Arc::new(Mutex::new(recovered)),
         updates,
         store: Arc::new(store),
     };
+    let ids: Vec<_> = state.worlds.lock().await.keys().copied().collect();
+    for id in ids {
+        spawn_world_scheduler(state.clone(), id);
+    }
     Ok(Router::new()
         .route(
             "/api/v1/health",
@@ -46,6 +57,7 @@ pub async fn app(store: Store) -> Result<Router, sqlx::Error> {
         )
         .route("/api/v1/worlds", get(list_worlds).post(create_world))
         .route("/api/v1/worlds/:id", get(get_world))
+        .route("/api/v1/worlds/:id/replay", get(replay_world))
         .route("/api/v1/worlds/:id/commands", post(command))
         .route("/api/v1/worlds/:id/stream", get(websocket))
         .with_state(state)
@@ -56,11 +68,13 @@ pub async fn app(store: Store) -> Result<Router, sqlx::Error> {
 struct CreateRequest {
     name: String,
     seed: u64,
-    #[serde(default = "default_tick")]
-    tick_duration_seconds: u32,
+    #[serde(default)]
+    size: WorldSize,
+    #[serde(default = "default_tick_ms")]
+    tick_duration_ms: u32,
 }
-fn default_tick() -> u32 {
-    1
+fn default_tick_ms() -> u32 {
+    1000
 }
 async fn create_world(
     State(s): State<AppState>,
@@ -69,7 +83,8 @@ async fn create_world(
     let config = WorldConfig {
         name: input.name,
         seed: input.seed,
-        tick_duration_seconds: input.tick_duration_seconds,
+        size: input.size,
+        tick_duration_ms: input.tick_duration_ms,
     };
     config.validate().map_err(ApiError::bad_request)?;
     let id = WorldId::new();
@@ -87,8 +102,52 @@ async fn create_world(
         .lock()
         .await
         .insert(id, Arc::new(Mutex::new(world)));
-    let _ = s.updates.send(snapshot.clone());
+    spawn_world_scheduler(s.clone(), id);
+    let _ = s.updates.send(WorldUpdate::from(&snapshot));
     Ok((StatusCode::CREATED, Json(snapshot)))
+}
+
+fn spawn_world_scheduler(s: AppState, id: WorldId) {
+    tokio::spawn(async move {
+        loop {
+            let world = s.worlds.lock().await.get(&id).cloned();
+            let Some(world) = world else {
+                break;
+            };
+            let duration = {
+                let world = world.lock().await;
+                if world.is_running() {
+                    Some(world.tick_duration_ms())
+                } else {
+                    None
+                }
+            };
+            let Some(duration) = duration else {
+                sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            sleep(Duration::from_millis(u64::from(duration))).await;
+            let (snapshot, update) = {
+                let mut world = world.lock().await;
+                if !world.is_running() {
+                    continue;
+                }
+                if let Err(error) = world.apply(SimulationCommand::Advance { ticks: 1 }) {
+                    tracing::error!(%error, world_id = %id.0, "scheduled simulation tick failed");
+                    continue;
+                }
+                let update = world.update();
+                let snapshot = snapshot_if_checkpoint(&world);
+                (snapshot, update)
+            };
+            if let Some(snapshot) = snapshot {
+                if let Err(error) = s.store.checkpoint(&snapshot).await {
+                    tracing::error!(%error, world_id = %id.0, tick=snapshot.tick, "scheduled checkpoint failed");
+                }
+            }
+            let _ = s.updates.send(update);
+        }
+    });
 }
 async fn list_worlds(State(s): State<AppState>) -> Json<Vec<WorldSnapshot>> {
     let worlds: Vec<_> = s.worlds.lock().await.values().cloned().collect();
@@ -112,6 +171,31 @@ async fn get_world(
         .ok_or_else(ApiError::not_found)?;
     let snapshot = world.lock().await.snapshot();
     Ok(Json(snapshot))
+}
+async fn replay_world(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id = parse_id(&id)?;
+    let world = s
+        .worlds
+        .lock()
+        .await
+        .get(&id)
+        .cloned()
+        .ok_or_else(ApiError::not_found)?;
+    let current = world.lock().await.snapshot();
+    let replayed = s
+        .store
+        .replay(id, current.tick)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(serde_json::json!({
+        "target_tick": current.tick,
+        "matches": current.state_hash == replayed.state_hash,
+        "current_hash": current.state_hash,
+        "replayed": replayed
+    })))
 }
 async fn command(
     State(s): State<AppState>,
@@ -138,7 +222,7 @@ async fn command(
         .checkpoint(&snapshot)
         .await
         .map_err(ApiError::internal)?;
-    let _ = s.updates.send(snapshot.clone());
+    let _ = s.updates.send(WorldUpdate::from(&snapshot));
     drop(world);
     Ok(Json(snapshot))
 }
@@ -165,8 +249,8 @@ async fn stream_world(mut socket: WebSocket, s: AppState, id: WorldId) {
     }
     loop {
         match rx.recv().await {
-            Ok(snapshot) if snapshot.id == id => {
-                if let Ok(json) = serde_json::to_string(&snapshot) {
+            Ok(update) if update.id == id => {
+                if let Ok(json) = serde_json::to_string(&update) {
                     if socket.send(Message::Text(json)).await.is_err() {
                         break;
                     }
@@ -176,6 +260,9 @@ async fn stream_world(mut socket: WebSocket, s: AppState, id: WorldId) {
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }
+}
+fn snapshot_if_checkpoint(world: &World) -> Option<WorldSnapshot> {
+    (world.day().is_multiple_of(100)).then(|| world.snapshot())
 }
 fn parse_id(raw: &str) -> Result<WorldId, ApiError> {
     Uuid::parse_str(raw)
@@ -214,12 +301,20 @@ mod tests {
     use futures_util::StreamExt;
     #[test]
     fn create_request_rejects_empty_name() {
-        let c = WorldConfig {
-            name: " ".into(),
-            seed: 1,
-            tick_duration_seconds: 1,
+        let request: CreateRequest =
+            serde_json::from_str(r#"{"name":" ","seed":1,"size":"small","tick_duration_ms":1000}"#)
+                .unwrap();
+        let config = WorldConfig {
+            name: request.name,
+            seed: request.seed,
+            size: request.size,
+            tick_duration_ms: request.tick_duration_ms,
         };
-        assert!(c.validate().is_err());
+        assert!(config.validate().is_err());
+        assert!(serde_json::from_str::<CreateRequest>(
+            r#"{"name":"world","seed":1,"size":"tiny","tick_duration_ms":1000}"#
+        )
+        .is_err());
     }
     #[test]
     fn rejects_malformed_world_id() {
@@ -243,7 +338,8 @@ mod tests {
         let config = WorldConfig {
             name: "stream".into(),
             seed: 1,
-            tick_duration_seconds: 1,
+            size: WorldSize::Small,
+            tick_duration_ms: 1000,
         };
         let world = World::new(WorldId::new(), config).unwrap();
         let mut world = world;
@@ -251,7 +347,7 @@ mod tests {
         world
             .apply(SimulationCommand::Advance { ticks: 1 })
             .unwrap();
-        let expected = world.snapshot();
+        let expected = world.update();
         tx.send(expected.clone()).unwrap();
         let received = rx.recv().await.unwrap();
         assert_eq!(received.tick, expected.tick);
@@ -265,6 +361,10 @@ mod tests {
             return;
         };
         let store = Store::connect(&url).await.unwrap();
+        let cleanup_pool = sqlx::postgres::PgPoolOptions::new()
+            .connect(&url)
+            .await
+            .unwrap();
         let app = app(store).await.unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -273,7 +373,7 @@ mod tests {
         let created: WorldSnapshot = client
             .post(format!("http://{address}/api/v1/worlds"))
             .json(
-                &serde_json::json!({"name":"websocket-test","seed":177,"tick_duration_seconds":1}),
+                &serde_json::json!({"name":"websocket-test","seed":177,"size":"small","tick_duration_ms":1000}),
             )
             .send()
             .await
@@ -321,9 +421,7 @@ mod tests {
             .into_text()
             .unwrap();
         assert_eq!(
-            serde_json::from_str::<WorldSnapshot>(&started)
-                .unwrap()
-                .tick,
+            serde_json::from_str::<WorldUpdate>(&started).unwrap().tick,
             0
         );
         client
@@ -345,9 +443,28 @@ mod tests {
             .into_text()
             .unwrap();
         assert_eq!(
-            serde_json::from_str::<WorldSnapshot>(&update).unwrap().tick,
+            serde_json::from_str::<WorldUpdate>(&update).unwrap().tick,
             1
         );
+        let replay: serde_json::Value = client
+            .get(format!(
+                "http://{address}/api/v1/worlds/{}/replay",
+                created.id.0
+            ))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(replay["matches"], true);
         server.abort();
+        sqlx::query("DELETE FROM worlds WHERE id=$1")
+            .bind(created.id.0)
+            .execute(&cleanup_pool)
+            .await
+            .unwrap();
     }
 }

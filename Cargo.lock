@@ -1623,8 +1623,7 @@ name = "simlife-engine"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "rand 0.8.8",
- "rand_chacha",
+ "serde",
  "serde_json",
  "simlife-domain",
  "thiserror 2.0.21",

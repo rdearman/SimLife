@@ -22,7 +22,7 @@ async fn main() -> Result<()> {
     tracing::info!(address=%bind, "SimLife server listening");
     let app = simlife_server::app(store)
         .await
-        .context("recover worlds from PostgreSQL")?;
+        .map_err(|e| anyhow::anyhow!("recover worlds from PostgreSQL: {e}"))?;
     axum::serve(listener, app).await?;
     Ok(())
 }

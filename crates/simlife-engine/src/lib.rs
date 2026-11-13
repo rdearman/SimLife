@@ -1,7 +1,15 @@
-use rand::{RngCore, SeedableRng};
-use rand_chacha::ChaCha8Rng;
-use simlife_domain::{RunState, SimulationCommand, WorldConfig, WorldId, WorldSnapshot};
+use blake3::Hasher;
+use serde::Serialize;
+use simlife_domain::{
+    Alleles, Diet, Genome, Organism, Resources, RunState, Sex, SimulationCommand, TerrainType,
+    Tile, WorldConfig, WorldId, WorldSnapshot, WorldStatistics, WorldUpdate,
+};
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
+
+const MAX_ORGANISMS: usize = 100_000;
+const INITIAL_ENERGY: u32 = 100;
+const INITIAL_WATER: u32 = 30;
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -13,31 +21,82 @@ pub enum EngineError {
     InvalidAdvance,
     #[error("checkpoint state hash does not match its contents")]
     InvalidCheckpoint,
+    #[error("world coordinates are outside the map")]
+    OutOfBounds,
+    #[error("world population limit reached")]
+    PopulationLimit,
 }
 
-/// Standalone deterministic world state. This crate has no networking or storage dependencies.
+/// Versioned integer PRNG: SplitMix64. The state is checkpointed with the world.
+#[derive(Clone, Copy, Debug)]
+struct DeterministicRng {
+    state: u64,
+}
+impl DeterministicRng {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+    fn state(&self) -> u64 {
+        self.state
+    }
+    fn next(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    }
+    fn below(&mut self, upper: u64) -> u64 {
+        if upper <= 1 {
+            return 0;
+        }
+        let threshold = upper.wrapping_neg() % upper;
+        loop {
+            let n = self.next();
+            if n >= threshold {
+                return n % upper;
+            }
+        }
+    }
+}
+
+/// A standalone, deterministic world. All authoritative transitions are integer-only,
+/// single-threaded, and independent of the server runtime and persistence layer.
 pub struct World {
     id: WorldId,
     config: WorldConfig,
     state: RunState,
     tick: u64,
-    rng: ChaCha8Rng,
-    rng_marker: u64,
+    width: u16,
+    height: u16,
+    tiles: Vec<Tile>,
+    organisms: Vec<Organism>,
+    statistics: WorldStatistics,
+    rng: DeterministicRng,
+    next_organism_id: u64,
 }
 
 impl World {
     pub fn new(id: WorldId, config: WorldConfig) -> Result<Self, EngineError> {
         config.validate().map_err(EngineError::InvalidConfig)?;
-        let seed = config.seed;
+        let (width, height) = config.size.dimensions();
+        let mut rng = DeterministicRng::new(config.seed);
+        let tiles = generate_terrain(width, height, &mut rng);
         Ok(Self {
             id,
             config,
             state: RunState::Created,
             tick: 0,
-            rng: ChaCha8Rng::seed_from_u64(seed),
-            rng_marker: 0,
+            width,
+            height,
+            tiles,
+            organisms: Vec::new(),
+            statistics: WorldStatistics::default(),
+            rng,
+            next_organism_id: 1,
         })
     }
+
     pub fn apply(&mut self, command: SimulationCommand) -> Result<(), EngineError> {
         match command {
             SimulationCommand::Start if self.state == RunState::Created => {
@@ -49,12 +108,27 @@ impl World {
             SimulationCommand::Pause if self.state == RunState::Running => {
                 self.state = RunState::Paused
             }
+            SimulationCommand::SetSpeed { tick_duration_ms }
+                if (10..=60_000).contains(&tick_duration_ms) =>
+            {
+                self.config.tick_duration_ms = tick_duration_ms
+            }
+            SimulationCommand::SetSpeed { .. } => {
+                return Err(EngineError::InvalidConfig(
+                    "tick_duration_ms must be 10..=60000".into(),
+                ))
+            }
+            SimulationCommand::IntroduceOrganism { x, y, genome } => {
+                self.introduce(x, y, genome)?
+            }
             SimulationCommand::Advance { ticks }
                 if self.state == RunState::Running && (1..=100_000).contains(&ticks) =>
             {
+                if self.tick.checked_add(ticks).is_none() {
+                    return Err(EngineError::InvalidAdvance);
+                }
                 for _ in 0..ticks {
-                    self.tick += 1;
-                    self.rng_marker = self.rng.next_u64();
+                    self.advance_one_day();
                 }
             }
             SimulationCommand::Advance { .. } => return Err(EngineError::InvalidAdvance),
@@ -62,33 +136,445 @@ impl World {
         }
         Ok(())
     }
+
+    fn introduce(&mut self, x: u16, y: u16, genome: Genome) -> Result<(), EngineError> {
+        if x >= self.width || y >= self.height {
+            return Err(EngineError::OutOfBounds);
+        }
+        if self.organisms.len() >= MAX_ORGANISMS {
+            return Err(EngineError::PopulationLimit);
+        }
+        genome.validate().map_err(EngineError::InvalidConfig)?;
+        let id = self.next_organism_id;
+        self.next_organism_id += 1;
+        // Sex is not a species trait: matching founders can form a breeding population.
+        let mut signature = genome.clone();
+        signature.sex = Sex::Asexual;
+        let species_id = self
+            .organisms
+            .iter()
+            .find(|organism| {
+                let mut candidate = organism.genome.clone();
+                candidate.sex = Sex::Asexual;
+                candidate == signature
+            })
+            .map_or(id, |organism| organism.species_id);
+        self.organisms.push(Organism {
+            id,
+            species_id,
+            x,
+            y,
+            age_days: 0,
+            energy: INITIAL_ENERGY,
+            water_reserve: INITIAL_WATER,
+            genome,
+        });
+        Ok(())
+    }
+
+    fn advance_one_day(&mut self) {
+        self.tick += 1;
+        self.regenerate_resources();
+        self.move_and_metabolize();
+        self.feed_herbivores();
+        self.resolve_predation();
+        self.resolve_deaths();
+        self.reproduce();
+    }
+
+    fn regenerate_resources(&mut self) {
+        for tile in &mut self.tiles {
+            let growth = 1 + u32::from(tile.moisture / 32);
+            tile.resources.vegetation = (tile.resources.vegetation + growth).min(1000);
+            if self.tick.is_multiple_of(7) && tile.terrain != TerrainType::Desert {
+                tile.resources.water = tile
+                    .resources
+                    .water
+                    .saturating_add(u32::from(tile.moisture / 8))
+                    .min(1000);
+            }
+            if matches!(
+                tile.terrain,
+                TerrainType::Ocean | TerrainType::Lake | TerrainType::River
+            ) {
+                tile.resources.water = 1000;
+            }
+        }
+    }
+
+    fn move_and_metabolize(&mut self) {
+        self.organisms.sort_by_key(|o| o.id);
+        for organism in &mut self.organisms {
+            organism.age_days = organism.age_days.saturating_add(1);
+            organism.energy = organism
+                .energy
+                .saturating_sub(u32::from(organism.genome.metabolism.expressed().max(1)));
+            organism.water_reserve = organism.water_reserve.saturating_sub(1);
+            let speed = organism.genome.speed.expressed().min(4);
+            for _ in 0..speed {
+                let direction = self.rng.below(8);
+                let (dx, dy) = match direction {
+                    0 => (-1_i32, -1_i32),
+                    1 => (0, -1),
+                    2 => (1, -1),
+                    3 => (-1, 0),
+                    4 => (1, 0),
+                    5 => (-1, 1),
+                    6 => (0, 1),
+                    _ => (1, 1),
+                };
+                organism.x = (i32::from(organism.x) + dx).rem_euclid(i32::from(self.width)) as u16;
+                organism.y = (i32::from(organism.y) + dy).rem_euclid(i32::from(self.height)) as u16;
+            }
+            let index = tile_index(self.width, organism.x, organism.y);
+            if self.tiles[index].resources.water > 0 && organism.water_reserve < INITIAL_WATER {
+                self.tiles[index].resources.water -= 1;
+                organism.water_reserve = (organism.water_reserve + 4).min(INITIAL_WATER);
+            }
+        }
+    }
+
+    fn feed_herbivores(&mut self) {
+        for organism in &mut self.organisms {
+            if matches!(organism.genome.diet, Diet::Herbivore | Diet::Omnivore)
+                && organism.energy < INITIAL_ENERGY
+            {
+                let index = tile_index(self.width, organism.x, organism.y);
+                let eaten = self.tiles[index].resources.vegetation.min(40);
+                self.tiles[index].resources.vegetation -= eaten;
+                organism.energy = (organism.energy + eaten).min(INITIAL_ENERGY);
+            }
+        }
+    }
+
+    fn resolve_predation(&mut self) {
+        let mut prey_by_tile: HashMap<(u16, u16), Vec<u64>> = HashMap::new();
+        let mut predator_indices = Vec::new();
+        for (index, organism) in self.organisms.iter().enumerate() {
+            match organism.genome.diet {
+                Diet::Herbivore | Diet::Omnivore => prey_by_tile
+                    .entry((organism.x, organism.y))
+                    .or_default()
+                    .push(organism.id),
+                Diet::Carnivore if organism.energy < INITIAL_ENERGY => predator_indices.push(index),
+                Diet::Carnivore => {}
+            }
+        }
+        let mut killed = HashSet::new();
+        let mut eaten_by_tile: HashMap<(u16, u16), usize> = HashMap::new();
+        for predator_index in predator_indices {
+            let predator = &self.organisms[predator_index];
+            let key = (predator.x, predator.y);
+            let used = eaten_by_tile.entry(key).or_default();
+            let prey = prey_by_tile
+                .get(&key)
+                .and_then(|ids| ids.iter().skip(*used).find(|id| **id != predator.id))
+                .copied();
+            if let Some(prey_id) = prey {
+                *used += 1;
+                killed.insert(prey_id);
+                self.organisms[predator_index].energy =
+                    (self.organisms[predator_index].energy + 50).min(INITIAL_ENERGY);
+            }
+        }
+        if !killed.is_empty() {
+            self.organisms.retain(|o| !killed.contains(&o.id));
+            let deaths = killed.len() as u64;
+            self.statistics.deaths += deaths;
+            self.statistics.predation_deaths += deaths;
+        }
+    }
+
+    fn resolve_deaths(&mut self) {
+        let old_len = self.organisms.len();
+        self.organisms
+            .retain(|o| o.energy > 0 && o.water_reserve > 0 && o.age_days < o.genome.lifespan_days);
+        self.statistics.deaths += (old_len - self.organisms.len()) as u64;
+    }
+
+    fn reproduce(&mut self) {
+        if self.organisms.len() >= MAX_ORGANISMS {
+            return;
+        }
+        let males_by_location: HashMap<(u64, u16, u16), Vec<Organism>> = self
+            .organisms
+            .iter()
+            .filter(|o| o.genome.sex == Sex::Male && o.age_days >= 30 && o.energy >= 75)
+            .fold(HashMap::new(), |mut by_location, organism| {
+                by_location
+                    .entry((organism.species_id, organism.x, organism.y))
+                    .or_default()
+                    .push(organism.clone());
+                by_location
+            });
+        let mut newborns = Vec::new();
+        let mut paired = HashSet::new();
+        for i in 0..self.organisms.len() {
+            if self.organisms.len() + newborns.len() >= MAX_ORGANISMS {
+                break;
+            }
+            let parent = &self.organisms[i];
+            if parent.age_days < 30
+                || parent.energy < 75
+                || parent.genome.fertility.expressed() == 0
+            {
+                continue;
+            }
+            if self.rng.below(100) >= u64::from(parent.genome.fertility.expressed()) {
+                continue;
+            }
+            let other = match parent.genome.sex {
+                Sex::Asexual => None,
+                Sex::Female => males_by_location
+                    .get(&(parent.species_id, parent.x, parent.y))
+                    .and_then(|males| males.iter().find(|male| !paired.contains(&male.id)))
+                    .cloned(),
+                Sex::Male => continue,
+            };
+            if parent.genome.sex != Sex::Asexual && other.is_none() {
+                continue;
+            }
+            if let Some(ref mate) = other {
+                paired.insert(mate.id);
+            }
+            let mut genome = if let Some(ref mate) = other {
+                inherit(&parent.genome, &mate.genome, &mut self.rng)
+            } else {
+                parent.genome.clone()
+            };
+            mutate(&mut genome, &mut self.rng);
+            let id = self.next_organism_id;
+            self.next_organism_id += 1;
+            let mut child = parent.clone();
+            child.id = id;
+            child.genome = genome;
+            child.age_days = 0;
+            child.energy = 50;
+            child.water_reserve = INITIAL_WATER;
+            self.organisms[i].energy -= 25;
+            newborns.push(child);
+        }
+        self.statistics.births += newborns.len() as u64;
+        self.organisms.extend(newborns);
+    }
+
     pub fn snapshot(&self) -> WorldSnapshot {
-        let canonical = serde_json::json!({ "id": self.id, "config": self.config, "state": self.state, "tick": self.tick, "rng_marker": self.rng_marker });
+        let state_hash = self.state_hash();
         WorldSnapshot {
             id: self.id,
             config: self.config.clone(),
             state: self.state,
             tick: self.tick,
-            state_hash: blake3::hash(canonical.to_string().as_bytes())
-                .to_hex()
-                .to_string(),
+            width: self.width,
+            height: self.height,
+            tiles: self.tiles.clone(),
+            organisms: self.organisms.clone(),
+            statistics: self.statistics.clone(),
+            rng_state: self.rng.state(),
+            next_organism_id: self.next_organism_id,
+            state_hash,
         }
     }
-    pub fn restore(snapshot: &WorldSnapshot) -> Result<Self, EngineError> {
-        let mut world = Self::new(snapshot.id, snapshot.config.clone())?;
-        world.state = snapshot.state;
-        // M1 stores the hashable state; deterministic RNG stream restoration is addressed by replaying ticks.
-        if snapshot.tick > 0 {
-            for _ in 0..snapshot.tick {
-                world.rng_marker = world.rng.next_u64();
-            }
+
+    pub fn update(&self) -> WorldUpdate {
+        WorldUpdate {
+            id: self.id,
+            config: self.config.clone(),
+            state: self.state,
+            tick: self.tick,
+            organisms: self.organisms.clone(),
+            statistics: self.statistics.clone(),
+            state_hash: self.state_hash(),
         }
-        world.tick = snapshot.tick;
-        if world.snapshot().state_hash != snapshot.state_hash {
+    }
+
+    fn state_hash(&self) -> String {
+        #[derive(Serialize)]
+        struct Canonical<'a> {
+            tick: u64,
+            width: u16,
+            height: u16,
+            tiles: &'a [Tile],
+            organisms: &'a [Organism],
+            statistics: &'a WorldStatistics,
+            rng_state: u64,
+            next_organism_id: u64,
+        }
+        let state = Canonical {
+            tick: self.tick,
+            width: self.width,
+            height: self.height,
+            tiles: &self.tiles,
+            organisms: &self.organisms,
+            statistics: &self.statistics,
+            rng_state: self.rng.state(),
+            next_organism_id: self.next_organism_id,
+        };
+        let bytes = serde_json::to_vec(&state).expect("canonical state serializes");
+        let mut hasher = Hasher::new();
+        hasher.update(b"simlife-world-state-v2\0");
+        hasher.update(&bytes);
+        hasher.finalize().to_hex().to_string()
+    }
+
+    pub fn restore(snapshot: &WorldSnapshot) -> Result<Self, EngineError> {
+        snapshot
+            .config
+            .validate()
+            .map_err(EngineError::InvalidConfig)?;
+        let (expected_width, expected_height) = snapshot.config.size.dimensions();
+        if snapshot.width != expected_width
+            || snapshot.height != expected_height
+            || snapshot.tiles.len() != usize::from(snapshot.width) * usize::from(snapshot.height)
+        {
+            return Err(EngineError::InvalidCheckpoint);
+        }
+        if snapshot.organisms.iter().any(|o| {
+            o.x >= snapshot.width || o.y >= snapshot.height || o.genome.validate().is_err()
+        }) {
+            return Err(EngineError::InvalidCheckpoint);
+        }
+        let world = Self {
+            id: snapshot.id,
+            config: snapshot.config.clone(),
+            state: snapshot.state,
+            tick: snapshot.tick,
+            width: snapshot.width,
+            height: snapshot.height,
+            tiles: snapshot.tiles.clone(),
+            organisms: snapshot.organisms.clone(),
+            statistics: snapshot.statistics.clone(),
+            rng: DeterministicRng {
+                state: snapshot.rng_state,
+            },
+            next_organism_id: snapshot.next_organism_id,
+        };
+        if world.state_hash() != snapshot.state_hash {
             return Err(EngineError::InvalidCheckpoint);
         }
         Ok(world)
     }
+
+    pub fn day(&self) -> u64 {
+        self.tick
+    }
+    pub fn tick_duration_ms(&self) -> u32 {
+        self.config.tick_duration_ms
+    }
+    pub fn is_running(&self) -> bool {
+        self.state == RunState::Running
+    }
+}
+
+fn tile_index(width: u16, x: u16, y: u16) -> usize {
+    usize::from(y) * usize::from(width) + usize::from(x)
+}
+fn generate_terrain(width: u16, height: u16, rng: &mut DeterministicRng) -> Vec<Tile> {
+    let len = usize::from(width) * usize::from(height);
+    let mut elevations: Vec<i16> = (0..len).map(|_| (rng.below(201) as i16) - 100).collect();
+    let moisture: Vec<u8> = (0..len).map(|_| rng.below(101) as u8).collect();
+    for _ in 0..2 {
+        let mut smoothed = elevations.clone();
+        for y in 0..height {
+            for x in 0..width {
+                let idx = tile_index(width, x, y);
+                let left = tile_index(width, (x + width - 1) % width, y);
+                let right = tile_index(width, (x + 1) % width, y);
+                let up = tile_index(width, x, (y + height - 1) % height);
+                let down = tile_index(width, x, (y + 1) % height);
+                smoothed[idx] = ((i32::from(elevations[idx]) * 2
+                    + i32::from(elevations[left])
+                    + i32::from(elevations[right])
+                    + i32::from(elevations[up])
+                    + i32::from(elevations[down]))
+                    / 6) as i16;
+            }
+        }
+        elevations = smoothed;
+    }
+    elevations
+        .into_iter()
+        .zip(moisture)
+        .map(|(elevation, moisture)| {
+            let terrain = if elevation < -60 {
+                TerrainType::Ocean
+            } else if elevation < -44 && rng.below(5) == 0 {
+                TerrainType::Lake
+            } else if elevation < -30 && rng.below(8) == 0 {
+                TerrainType::River
+            } else if elevation > 70 {
+                TerrainType::Mountain
+            } else if moisture < 22 {
+                TerrainType::Desert
+            } else if moisture > 62 {
+                TerrainType::Forest
+            } else {
+                TerrainType::Plains
+            };
+            let (water, vegetation) = match terrain {
+                TerrainType::Ocean | TerrainType::Lake | TerrainType::River => (1000, 0),
+                TerrainType::Forest => (u32::from(moisture) * 3, 700),
+                TerrainType::Plains => (u32::from(moisture) * 2, 450),
+                TerrainType::Desert => (u32::from(moisture) / 2, 80),
+                TerrainType::Mountain => (u32::from(moisture), 30),
+            };
+            Tile {
+                elevation,
+                moisture,
+                terrain,
+                resources: Resources {
+                    water,
+                    vegetation,
+                    minerals: 100 + rng.below(901) as u32,
+                },
+            }
+        })
+        .collect()
+}
+
+fn inherit(a: &Genome, b: &Genome, rng: &mut DeterministicRng) -> Genome {
+    fn pair(a: Alleles, b: Alleles, rng: &mut DeterministicRng) -> Alleles {
+        let av = if rng.below(2) == 0 { a.first } else { a.second };
+        let bv = if rng.below(2) == 0 { b.first } else { b.second };
+        Alleles {
+            first: av,
+            second: bv,
+        }
+    }
+    Genome {
+        speed: pair(a.speed, b.speed, rng),
+        metabolism: pair(a.metabolism, b.metabolism, rng),
+        fertility: pair(a.fertility, b.fertility, rng),
+        lifespan_days: if rng.below(2) == 0 {
+            a.lifespan_days
+        } else {
+            b.lifespan_days
+        },
+        diet: if rng.below(2) == 0 { a.diet } else { b.diet },
+        sex: if rng.below(2) == 0 {
+            Sex::Female
+        } else {
+            Sex::Male
+        },
+    }
+}
+fn mutate(genome: &mut Genome, rng: &mut DeterministicRng) {
+    fn mutate_pair(pair: &mut Alleles, max: u8, rng: &mut DeterministicRng) {
+        for allele in [&mut pair.first, &mut pair.second] {
+            if rng.below(100) == 0 {
+                if *allele == 0 {
+                    *allele = 1;
+                } else if *allele >= max || rng.below(2) == 0 {
+                    *allele -= 1;
+                } else {
+                    *allele += 1;
+                }
+            }
+        }
+    }
+    mutate_pair(&mut genome.speed, 4, rng);
+    mutate_pair(&mut genome.metabolism, 20, rng);
+    mutate_pair(&mut genome.fertility, 100, rng);
 }
 
 #[cfg(test)]
@@ -98,54 +584,230 @@ mod tests {
         WorldConfig {
             name: "test".into(),
             seed,
-            tick_duration_seconds: 1,
+            size: simlife_domain::WorldSize::Small,
+            tick_duration_ms: 1000,
         }
     }
     #[test]
-    fn identical_seed_and_commands_hash_identically() {
-        let mut a = World::new(WorldId::new(), config(9)).unwrap();
-        let id = a.snapshot().id;
-        let mut b = World::new(id, config(9)).unwrap();
+    fn identical_seeds_match_even_with_distinct_world_ids() {
+        let a = World::new(WorldId::new(), config(9)).unwrap();
+        let mut b = World::new(WorldId::new(), config(9)).unwrap();
+        let mut a = a;
         a.apply(SimulationCommand::Start).unwrap();
         b.apply(SimulationCommand::Start).unwrap();
-        a.apply(SimulationCommand::Advance { ticks: 25 }).unwrap();
-        b.apply(SimulationCommand::Advance { ticks: 25 }).unwrap();
+        a.apply(SimulationCommand::Advance { ticks: 100 }).unwrap();
+        b.apply(SimulationCommand::Advance { ticks: 100 }).unwrap();
         assert_eq!(a.snapshot().state_hash, b.snapshot().state_hash);
     }
     #[test]
-    fn worlds_advance_independently() {
+    fn terrain_is_nonempty_and_deterministic() {
+        let a = World::new(WorldId::new(), config(9)).unwrap();
+        let b = World::new(WorldId::new(), config(9)).unwrap();
+        let sa = a.snapshot();
+        let sb = b.snapshot();
+        assert_eq!(sa.tiles, sb.tiles);
+        assert_eq!(sa.tiles.len(), 32 * 64);
+        assert!(sa.tiles.iter().any(|t| t.terrain == TerrainType::Ocean));
+        assert!(sa.tiles.iter().any(|t| t.resources.vegetation > 0));
+    }
+    #[test]
+    fn world_clocks_are_independent_and_transitions_checked() {
         let mut a = World::new(WorldId::new(), config(1)).unwrap();
         let b = World::new(WorldId::new(), config(1)).unwrap();
+        assert!(a.apply(SimulationCommand::Pause).is_err());
         a.apply(SimulationCommand::Start).unwrap();
         a.apply(SimulationCommand::Advance { ticks: 2 }).unwrap();
-        assert_eq!(a.snapshot().tick, 2);
-        assert_eq!(b.snapshot().tick, 0);
+        assert_eq!(a.day(), 2);
+        assert_eq!(b.day(), 0);
     }
     #[test]
-    fn control_transitions_are_checked() {
-        let mut w = World::new(WorldId::new(), config(1)).unwrap();
-        assert!(w.apply(SimulationCommand::Pause).is_err());
-        w.apply(SimulationCommand::Start).unwrap();
-        w.apply(SimulationCommand::Pause).unwrap();
-        w.apply(SimulationCommand::Resume).unwrap();
-        w.apply(SimulationCommand::Advance { ticks: 1 }).unwrap();
-        assert_eq!(w.snapshot().tick, 1);
-    }
-    #[test]
-    fn zero_seed_is_rejected() {
-        assert!(World::new(WorldId::new(), config(0)).is_err());
-    }
-    #[test]
-    fn checkpoint_restores_the_deterministic_stream() {
+    fn checkpoints_restore_random_stream_and_state() {
         let mut original = World::new(WorldId::new(), config(77)).unwrap();
+        original
+            .apply(SimulationCommand::IntroduceOrganism {
+                x: 2,
+                y: 3,
+                genome: Genome::default(),
+            })
+            .unwrap();
         original.apply(SimulationCommand::Start).unwrap();
         original
-            .apply(SimulationCommand::Advance { ticks: 15 })
+            .apply(SimulationCommand::Advance { ticks: 10 })
             .unwrap();
-        let recovered = World::restore(&original.snapshot()).unwrap();
+        let mut restored = World::restore(&original.snapshot()).unwrap();
+        original
+            .apply(SimulationCommand::Advance { ticks: 50 })
+            .unwrap();
+        restored
+            .apply(SimulationCommand::Advance { ticks: 50 })
+            .unwrap();
         assert_eq!(
-            recovered.snapshot().state_hash,
-            original.snapshot().state_hash
+            original.snapshot().state_hash,
+            restored.snapshot().state_hash
         );
+    }
+    #[test]
+    fn coordinates_wrap_on_both_axes() {
+        let mut world = World::new(WorldId::new(), config(41)).unwrap();
+        let genome = Genome {
+            speed: Alleles {
+                first: 4,
+                second: 4,
+            },
+            ..Genome::default()
+        };
+        world
+            .apply(SimulationCommand::IntroduceOrganism { x: 0, y: 0, genome })
+            .unwrap();
+        world.apply(SimulationCommand::Start).unwrap();
+        world
+            .apply(SimulationCommand::Advance { ticks: 1 })
+            .unwrap();
+        let organism = &world.snapshot().organisms[0];
+        assert!(organism.x < 32 && organism.y < 64);
+    }
+
+    #[test]
+    fn organisms_age_and_die_at_genetic_lifespan() {
+        let mut world = World::new(WorldId::new(), config(12)).unwrap();
+        let genome = Genome {
+            lifespan_days: 1,
+            ..Genome::default()
+        };
+        world
+            .apply(SimulationCommand::IntroduceOrganism { x: 0, y: 0, genome })
+            .unwrap();
+        world.apply(SimulationCommand::Start).unwrap();
+        world
+            .apply(SimulationCommand::Advance { ticks: 1 })
+            .unwrap();
+        assert!(world.organisms.is_empty());
+        assert_eq!(world.statistics.deaths, 1);
+    }
+
+    #[test]
+    fn predators_consume_colocated_prey_and_account_for_death() {
+        let mut world = World::new(WorldId::new(), config(39)).unwrap();
+        for tile in &mut world.tiles {
+            tile.resources.vegetation = 1000;
+        }
+        let stationary = Alleles {
+            first: 0,
+            second: 0,
+        };
+        let predator = Genome {
+            speed: stationary,
+            diet: Diet::Carnivore,
+            ..Genome::default()
+        };
+        let prey = Genome {
+            speed: stationary,
+            diet: Diet::Herbivore,
+            ..Genome::default()
+        };
+        world
+            .apply(SimulationCommand::IntroduceOrganism {
+                x: 3,
+                y: 4,
+                genome: predator,
+            })
+            .unwrap();
+        world
+            .apply(SimulationCommand::IntroduceOrganism {
+                x: 3,
+                y: 4,
+                genome: prey,
+            })
+            .unwrap();
+        world.apply(SimulationCommand::Start).unwrap();
+        world
+            .apply(SimulationCommand::Advance { ticks: 1 })
+            .unwrap();
+        assert_eq!(world.organisms.len(), 1);
+        assert_eq!(world.statistics.predation_deaths, 1);
+    }
+
+    #[test]
+    fn eligible_asexual_population_reproduces_without_commands() {
+        let mut world = World::new(WorldId::new(), config(456)).unwrap();
+        for tile in &mut world.tiles {
+            tile.resources.vegetation = 1000;
+            tile.resources.water = 1000;
+        }
+        let genome = Genome {
+            speed: Alleles {
+                first: 0,
+                second: 0,
+            },
+            metabolism: Alleles {
+                first: 1,
+                second: 1,
+            },
+            fertility: Alleles {
+                first: 100,
+                second: 100,
+            },
+            ..Genome::default()
+        };
+        world
+            .apply(SimulationCommand::IntroduceOrganism { x: 5, y: 5, genome })
+            .unwrap();
+        world.apply(SimulationCommand::Start).unwrap();
+        world
+            .apply(SimulationCommand::Advance { ticks: 30 })
+            .unwrap();
+        assert!(world.statistics.births >= 1);
+        assert!(world.organisms.len() > 1);
+    }
+
+    #[test]
+    fn compatible_opposite_sex_founders_reproduce() {
+        let mut world = World::new(WorldId::new(), config(789)).unwrap();
+        for tile in &mut world.tiles {
+            tile.resources.vegetation = 1000;
+            tile.resources.water = 1000;
+        }
+        let base = Genome {
+            speed: Alleles {
+                first: 0,
+                second: 0,
+            },
+            metabolism: Alleles {
+                first: 1,
+                second: 1,
+            },
+            fertility: Alleles {
+                first: 100,
+                second: 100,
+            },
+            ..Genome::default()
+        };
+        let female = Genome {
+            sex: Sex::Female,
+            ..base.clone()
+        };
+        let male = Genome {
+            sex: Sex::Male,
+            ..base
+        };
+        world
+            .apply(SimulationCommand::IntroduceOrganism {
+                x: 4,
+                y: 5,
+                genome: female,
+            })
+            .unwrap();
+        world
+            .apply(SimulationCommand::IntroduceOrganism {
+                x: 4,
+                y: 5,
+                genome: male,
+            })
+            .unwrap();
+        world.apply(SimulationCommand::Start).unwrap();
+        world
+            .apply(SimulationCommand::Advance { ticks: 30 })
+            .unwrap();
+        assert!(world.statistics.births > 0);
     }
 }
