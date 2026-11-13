@@ -92,6 +92,16 @@ impl Store {
         id: WorldId,
         target_tick: u64,
     ) -> Result<WorldSnapshot, sqlx::Error> {
+        self.replay_with_mechanics(id, target_tick, simlife_engine::CURRENT_MECHANICS_VERSION)
+            .await
+    }
+
+    pub async fn replay_with_mechanics(
+        &self,
+        id: WorldId,
+        target_tick: u64,
+        mechanics_version: u16,
+    ) -> Result<WorldSnapshot, sqlx::Error> {
         let row: Option<(serde_json::Value,)> =
             sqlx::query_as("SELECT config FROM simulation_config WHERE world_id=$1")
                 .bind(id.0)
@@ -102,7 +112,7 @@ impl Store {
         };
         let config: WorldConfig = serde_json::from_value(config_json)
             .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
-        let mut world = simlife_engine::World::new(id, config)
+        let mut world = simlife_engine::World::new_with_mechanics(id, config, mechanics_version)
             .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
         let events: Vec<(String, i64)> = sqlx::query_as(
             "SELECT command, world_tick FROM command_events WHERE world_id=$1 ORDER BY id",
@@ -225,6 +235,12 @@ mod tests {
         let replayed = store.replay(snapshot.id, snapshot.tick).await.unwrap();
         assert_eq!(replayed.state_hash, snapshot.state_hash);
         assert_eq!(replayed.population_history, snapshot.population_history);
+
+        assert_eq!(
+            recovered.mechanics_version,
+            simlife_engine::CURRENT_MECHANICS_VERSION
+        );
+        assert!(recovered.speciation_events.is_empty());
         sqlx::query("DELETE FROM worlds WHERE id=$1")
             .bind(snapshot.id.0)
             .execute(&store.pool)

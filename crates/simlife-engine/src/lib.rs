@@ -2,8 +2,9 @@ use blake3::Hasher;
 use serde::Serialize;
 use simlife_domain::{
     AlleleFrequencySample, Alleles, Diet, Genome, Organism, OrganismInspection, OrganismLineage,
-    PopulationSample, Resources, RunState, Sex, SimulationCommand, SpeciesLineage, TerrainType,
-    Tile, WorldConfig, WorldId, WorldSnapshot, WorldStatistics, WorldSummary, WorldUpdate,
+    PopulationSample, Resources, RunState, Sex, SimulationCommand, SpeciationEvent, SpeciesLineage,
+    TerrainType, Tile, WorldConfig, WorldId, WorldSnapshot, WorldStatistics, WorldSummary,
+    WorldUpdate,
 };
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
@@ -12,7 +13,9 @@ const MAX_ORGANISMS: usize = 100_000;
 const POPULATION_SAMPLE_EVERY_DAYS: u64 = 10;
 const MAX_POPULATION_SAMPLES: usize = 20_000;
 const MAX_ALLELE_HISTORY_ROWS: usize = 100_000;
-const MAX_ALLELE_SPECIES_PER_SAMPLE: usize = 32;
+pub const SPECIES_COMPATIBILITY_THRESHOLD_BP: u16 = 500;
+pub const LEGACY_MECHANICS_VERSION: u16 = 1;
+pub const CURRENT_MECHANICS_VERSION: u16 = 2;
 const INITIAL_ENERGY: u32 = 100;
 const INITIAL_WATER: u32 = 30;
 
@@ -30,6 +33,8 @@ pub enum EngineError {
     OutOfBounds,
     #[error("world population limit reached")]
     PopulationLimit,
+    #[error("unsupported mechanics version {0}")]
+    UnsupportedMechanicsVersion(u16),
 }
 
 /// Versioned integer PRNG: SplitMix64. The state is checkpointed with the world.
@@ -70,6 +75,7 @@ impl DeterministicRng {
 pub struct World {
     id: WorldId,
     config: WorldConfig,
+    mechanics_version: u16,
     state: RunState,
     tick: u64,
     width: u16,
@@ -81,12 +87,28 @@ pub struct World {
     allele_frequency_history: Vec<AlleleFrequencySample>,
     organism_lineage: Vec<OrganismLineage>,
     species_lineages: Vec<SpeciesLineage>,
+    speciation_events: Vec<SpeciationEvent>,
     rng: DeterministicRng,
     next_organism_id: u64,
+    next_species_id: u64,
 }
 
 impl World {
     pub fn new(id: WorldId, config: WorldConfig) -> Result<Self, EngineError> {
+        Self::new_with_mechanics(id, config, CURRENT_MECHANICS_VERSION)
+    }
+
+    pub fn new_with_mechanics(
+        id: WorldId,
+        config: WorldConfig,
+        mechanics_version: u16,
+    ) -> Result<Self, EngineError> {
+        if !matches!(
+            mechanics_version,
+            LEGACY_MECHANICS_VERSION | CURRENT_MECHANICS_VERSION
+        ) {
+            return Err(EngineError::UnsupportedMechanicsVersion(mechanics_version));
+        }
         config.validate().map_err(EngineError::InvalidConfig)?;
         let (width, height) = config.size.dimensions();
         let mut rng = DeterministicRng::new(config.seed);
@@ -94,6 +116,7 @@ impl World {
         let mut world = Self {
             id,
             config,
+            mechanics_version,
             state: RunState::Created,
             tick: 0,
             width,
@@ -105,8 +128,10 @@ impl World {
             allele_frequency_history: Vec::new(),
             organism_lineage: Vec::new(),
             species_lineages: Vec::new(),
+            speciation_events: Vec::new(),
             rng,
             next_organism_id: 1,
+            next_species_id: 1,
         };
         world.sample_population();
         world.sample_allele_frequencies();
@@ -163,18 +188,24 @@ impl World {
         genome.validate().map_err(EngineError::InvalidConfig)?;
         let id = self.next_organism_id;
         self.next_organism_id += 1;
-        // Sex is not a species trait: matching founders can form a breeding population.
-        let mut signature = genome.clone();
-        signature.sex = Sex::Asexual;
-        let species_id = self
-            .organisms
-            .iter()
-            .find(|organism| {
-                let mut candidate = organism.genome.clone();
-                candidate.sex = Sex::Asexual;
-                candidate == signature
-            })
-            .map_or(id, |organism| organism.species_id);
+        let species_id = if self.mechanics_version == CURRENT_MECHANICS_VERSION {
+            self.species_lineages
+                .iter()
+                .filter(|lineage| lineage.extinct_day.is_none())
+                .find(|lineage| genomes_compatible(&lineage.prototype_genome, &genome))
+                .map_or(id, |lineage| lineage.species_id)
+        } else {
+            let mut signature = genome.clone();
+            signature.sex = Sex::Asexual;
+            self.organisms
+                .iter()
+                .find(|organism| {
+                    let mut candidate = organism.genome.clone();
+                    candidate.sex = Sex::Asexual;
+                    candidate == signature
+                })
+                .map_or(id, |organism| organism.species_id)
+        };
         self.organisms.push(Organism {
             id,
             species_id,
@@ -252,7 +283,9 @@ impl World {
                 founder_organism_id: id,
                 founded_day: self.tick,
                 extinct_day: None,
+                prototype_genome: genome.clone(),
             });
+            self.next_species_id = self.next_species_id.max(species_id.saturating_add(1));
         }
         self.organism_lineage.push(OrganismLineage {
             organism_id: id,
@@ -307,11 +340,6 @@ impl World {
     fn sample_allele_frequencies(&mut self) {
         let mut by_species: HashMap<u64, AlleleFrequencySample> = HashMap::new();
         for organism in &self.organisms {
-            if !by_species.contains_key(&organism.species_id)
-                && by_species.len() >= MAX_ALLELE_SPECIES_PER_SAMPLE
-            {
-                continue;
-            }
             let sample =
                 by_species
                     .entry(organism.species_id)
@@ -487,16 +515,20 @@ impl World {
     }
 
     fn reproduce(&mut self) {
+        if self.mechanics_version == LEGACY_MECHANICS_VERSION {
+            self.reproduce_legacy();
+            return;
+        }
         if self.organisms.len() >= MAX_ORGANISMS {
             return;
         }
-        let males_by_location: HashMap<(u64, u16, u16), Vec<Organism>> = self
+        let males_by_location: HashMap<(u16, u16), Vec<Organism>> = self
             .organisms
             .iter()
             .filter(|o| o.genome.sex == Sex::Male && o.age_days >= 30 && o.energy >= 75)
             .fold(HashMap::new(), |mut by_location, organism| {
                 by_location
-                    .entry((organism.species_id, organism.x, organism.y))
+                    .entry((organism.x, organism.y))
                     .or_default()
                     .push(organism.clone());
                 by_location
@@ -507,7 +539,92 @@ impl World {
             if self.organisms.len() + newborns.len() >= MAX_ORGANISMS {
                 break;
             }
-            let parent = &self.organisms[i];
+            let parent = self.organisms[i].clone();
+            if parent.age_days < 30
+                || parent.energy < 75
+                || parent.genome.fertility.expressed() == 0
+            {
+                continue;
+            }
+            if self.rng.below(100) >= u64::from(parent.genome.fertility.expressed()) {
+                continue;
+            }
+            let other = match parent.genome.sex {
+                Sex::Asexual => None,
+                Sex::Female => males_by_location
+                    .get(&(parent.x, parent.y))
+                    .and_then(|males| {
+                        males.iter().find(|male| {
+                            !paired.contains(&male.id)
+                                && genomes_compatible(&parent.genome, &male.genome)
+                        })
+                    })
+                    .cloned(),
+                Sex::Male => continue,
+            };
+            if parent.genome.sex != Sex::Asexual && other.is_none() {
+                continue;
+            }
+            if let Some(ref mate) = other {
+                paired.insert(mate.id);
+            }
+            let mut genome = if let Some(ref mate) = other {
+                inherit(&parent.genome, &mate.genome, &mut self.rng)
+            } else {
+                parent.genome.clone()
+            };
+            mutate(&mut genome, &mut self.rng);
+            let id = self.next_organism_id;
+            self.next_organism_id += 1;
+            let child_species_id = self.speciate_if_needed(parent.species_id, id, &genome);
+            let mut child = parent.clone();
+            child.id = id;
+            child.species_id = child_species_id;
+            child.genome = genome;
+            child.parent_ids = if let Some(ref mate) = other {
+                vec![parent.id, mate.id]
+            } else {
+                vec![parent.id]
+            };
+            child.age_days = 0;
+            child.energy = 50;
+            child.water_reserve = INITIAL_WATER;
+            self.organisms[i].energy -= 25;
+            self.organism_lineage.push(OrganismLineage {
+                organism_id: id,
+                parent_ids: child.parent_ids.clone(),
+                species_id: child_species_id,
+                born_day: self.tick,
+                died_day: None,
+                genome_at_birth: child.genome.clone(),
+            });
+            newborns.push(child);
+        }
+        self.statistics.births += newborns.len() as u64;
+        self.organisms.extend(newborns);
+    }
+
+    fn reproduce_legacy(&mut self) {
+        if self.organisms.len() >= MAX_ORGANISMS {
+            return;
+        }
+        let males_by_location: HashMap<(u64, u16, u16), Vec<Organism>> = self
+            .organisms
+            .iter()
+            .filter(|o| o.genome.sex == Sex::Male && o.age_days >= 30 && o.energy >= 75)
+            .fold(HashMap::new(), |mut map, organism| {
+                map.entry((organism.species_id, organism.x, organism.y))
+                    .or_default()
+                    .push(organism.clone());
+                map
+            });
+        let mut newborns = Vec::new();
+        let mut paired = HashSet::new();
+        for i in 0..self.organisms.len() {
+            if self.organisms.len() + newborns.len() >= MAX_ORGANISMS {
+                break;
+            }
+            let parent = self.organisms[i].clone();
             if parent.age_days < 30
                 || parent.energy < 75
                 || parent.genome.fertility.expressed() == 0
@@ -554,7 +671,7 @@ impl World {
             self.organism_lineage.push(OrganismLineage {
                 organism_id: id,
                 parent_ids: child.parent_ids.clone(),
-                species_id: child.species_id,
+                species_id: parent.species_id,
                 born_day: self.tick,
                 died_day: None,
                 genome_at_birth: child.genome.clone(),
@@ -565,11 +682,53 @@ impl World {
         self.organisms.extend(newborns);
     }
 
+    fn speciate_if_needed(
+        &mut self,
+        parent_species_id: u64,
+        founder_id: u64,
+        genome: &Genome,
+    ) -> u64 {
+        let Some(prototype) = self
+            .species_lineages
+            .iter()
+            .find(|lineage| lineage.species_id == parent_species_id)
+            .map(|lineage| lineage.prototype_genome.clone())
+        else {
+            return parent_species_id;
+        };
+        let distance = genetic_distance_basis_points(&prototype, genome);
+        if distance <= SPECIES_COMPATIBILITY_THRESHOLD_BP {
+            return parent_species_id;
+        }
+
+        let species_id = self.next_species_id;
+        self.next_species_id = self.next_species_id.saturating_add(1);
+        self.species_lineages.push(SpeciesLineage {
+            species_id,
+            parent_species_id: Some(parent_species_id),
+            founder_organism_id: founder_id,
+            founded_day: self.tick,
+            extinct_day: None,
+            prototype_genome: genome.clone(),
+        });
+        self.speciation_events.push(SpeciationEvent {
+            sequence: self.speciation_events.len() as u64 + 1,
+            day: self.tick,
+            parent_species_id,
+            new_species_id: species_id,
+            founder_organism_id: founder_id,
+            genetic_distance_basis_points: distance,
+            threshold_basis_points: SPECIES_COMPATIBILITY_THRESHOLD_BP,
+        });
+        species_id
+    }
+
     pub fn snapshot(&self) -> WorldSnapshot {
         let state_hash = self.state_hash();
         WorldSnapshot {
             id: self.id,
             config: self.config.clone(),
+            mechanics_version: self.mechanics_version,
             state: self.state,
             tick: self.tick,
             width: self.width,
@@ -581,8 +740,15 @@ impl World {
             allele_frequency_history: self.allele_frequency_history.clone(),
             organism_lineage: self.organism_lineage.clone(),
             species_lineages: self.species_lineages.clone(),
+            speciation_events: self
+                .speciation_events
+                .iter()
+                .filter(|event| event.day == self.tick)
+                .cloned()
+                .collect(),
             rng_state: self.rng.state(),
             next_organism_id: self.next_organism_id,
+            next_species_id: self.next_species_id,
             state_hash,
         }
     }
@@ -607,6 +773,7 @@ impl World {
                 .cloned()
                 .collect(),
             species_lineages: self.species_lineages.clone(),
+            speciation_events: self.speciation_events.clone(),
             state_hash: self.state_hash(),
         }
     }
@@ -620,6 +787,7 @@ impl World {
             width: self.width,
             height: self.height,
             population: self.organisms.len() as u32,
+            species_count: self.species_lineages.len() as u32,
             statistics: self.statistics.clone(),
             state_hash: self.state_hash(),
         }
@@ -635,9 +803,12 @@ impl World {
             organisms: &'a [Organism],
             organism_lineage: &'a [OrganismLineage],
             species_lineages: &'a [SpeciesLineage],
+            speciation_events: &'a [SpeciationEvent],
             statistics: &'a WorldStatistics,
             rng_state: u64,
             next_organism_id: u64,
+            next_species_id: u64,
+            mechanics_version: u16,
         }
         let state = Canonical {
             tick: self.tick,
@@ -647,14 +818,17 @@ impl World {
             organisms: &self.organisms,
             organism_lineage: &self.organism_lineage,
             species_lineages: &self.species_lineages,
+            speciation_events: &self.speciation_events,
             statistics: &self.statistics,
             rng_state: self.rng.state(),
             next_organism_id: self.next_organism_id,
+            next_species_id: self.next_species_id,
+            mechanics_version: self.mechanics_version,
         };
         let bytes = serde_json::to_vec(&state).expect("canonical state serializes");
         let mut hasher = Hasher::new();
         // Population history is derived telemetry, not authoritative simulation state.
-        hasher.update(b"simlife-world-state-v3\0");
+        hasher.update(b"simlife-world-state-v4\0");
         hasher.update(&bytes);
         hasher.finalize().to_hex().to_string()
     }
@@ -664,6 +838,14 @@ impl World {
             .config
             .validate()
             .map_err(EngineError::InvalidConfig)?;
+        if !matches!(
+            snapshot.mechanics_version,
+            LEGACY_MECHANICS_VERSION | CURRENT_MECHANICS_VERSION
+        ) {
+            return Err(EngineError::UnsupportedMechanicsVersion(
+                snapshot.mechanics_version,
+            ));
+        }
         let (expected_width, expected_height) = snapshot.config.size.dimensions();
         if snapshot.width != expected_width
             || snapshot.height != expected_height
@@ -709,11 +891,59 @@ impl World {
                     .any(|record| record.organism_id == organism.id && record.died_day.is_none())
             })
             || snapshot.species_lineages.iter().any(|lineage| {
-                lineage.founded_day > snapshot.tick
+                lineage.species_id == 0
+                    || lineage.founder_organism_id == 0
+                    || lineage.founded_day > snapshot.tick
                     || lineage
                         .extinct_day
                         .is_some_and(|day| day < lineage.founded_day || day > snapshot.tick)
+                    || lineage.prototype_genome.validate().is_err()
             })
+            || snapshot
+                .species_lineages
+                .iter()
+                .enumerate()
+                .any(|(index, lineage)| {
+                    snapshot.species_lineages[..index]
+                        .iter()
+                        .any(|previous| previous.species_id == lineage.species_id)
+                        || lineage.parent_species_id.is_some_and(|parent_id| {
+                            !snapshot
+                                .species_lineages
+                                .iter()
+                                .any(|candidate| candidate.species_id == parent_id)
+                        })
+                        || !snapshot
+                            .organism_lineage
+                            .iter()
+                            .any(|record| record.organism_id == lineage.founder_organism_id)
+                })
+            || snapshot
+                .species_lineages
+                .iter()
+                .map(|lineage| lineage.species_id)
+                .max()
+                .is_some_and(|max_id| snapshot.next_species_id <= max_id)
+            || (snapshot.mechanics_version == LEGACY_MECHANICS_VERSION
+                && !snapshot.speciation_events.is_empty())
+            || snapshot.speciation_events.iter().any(|event| {
+                event.day > snapshot.tick
+                    || event.sequence == 0
+                    || event.sequence > snapshot.speciation_events.len() as u64
+                    || event.genetic_distance_basis_points > 10_000
+                    || event.genetic_distance_basis_points <= event.threshold_basis_points
+                    || event.threshold_basis_points != SPECIES_COMPATIBILITY_THRESHOLD_BP
+                    || !snapshot.species_lineages.iter().any(|lineage| {
+                        lineage.species_id == event.new_species_id
+                            && lineage.parent_species_id == Some(event.parent_species_id)
+                            && lineage.founder_organism_id == event.founder_organism_id
+                    })
+            })
+            || snapshot
+                .speciation_events
+                .iter()
+                .enumerate()
+                .any(|(index, event)| event.sequence != index as u64 + 1)
         {
             return Err(EngineError::InvalidCheckpoint);
         }
@@ -757,6 +987,7 @@ impl World {
         let world = Self {
             id: snapshot.id,
             config: snapshot.config.clone(),
+            mechanics_version: snapshot.mechanics_version,
             state: snapshot.state,
             tick: snapshot.tick,
             width: snapshot.width,
@@ -768,10 +999,12 @@ impl World {
             allele_frequency_history: snapshot.allele_frequency_history.clone(),
             organism_lineage: snapshot.organism_lineage.clone(),
             species_lineages: snapshot.species_lineages.clone(),
+            speciation_events: snapshot.speciation_events.clone(),
             rng: DeterministicRng {
                 state: snapshot.rng_state,
             },
             next_organism_id: snapshot.next_organism_id,
+            next_species_id: snapshot.next_species_id,
         };
         if world.state_hash() != snapshot.state_hash {
             return Err(EngineError::InvalidCheckpoint);
@@ -891,6 +1124,33 @@ fn generate_terrain(width: u16, height: u16, rng: &mut DeterministicRng) -> Vec<
             }
         })
         .collect()
+}
+
+/// Normalized diploid genetic distance on a 0..=10,000 basis-point scale.
+/// Sex is not inherited as species identity and does not affect compatibility.
+pub fn genetic_distance_basis_points(a: &Genome, b: &Genome) -> u16 {
+    fn pair_distance(a: Alleles, b: Alleles, max_allele: u8) -> u32 {
+        let mut a_values = [a.first, a.second];
+        let mut b_values = [b.first, b.second];
+        a_values.sort_unstable();
+        b_values.sort_unstable();
+        let difference = u32::from(a_values[0].abs_diff(b_values[0]))
+            + u32::from(a_values[1].abs_diff(b_values[1]));
+        difference * 10_000 / (2 * u32::from(max_allele))
+    }
+
+    let speed = pair_distance(a.speed, b.speed, 4);
+    let metabolism = pair_distance(a.metabolism, b.metabolism, 20);
+    let fertility = pair_distance(a.fertility, b.fertility, 100);
+    let lifespan =
+        u32::from(a.lifespan_days.abs_diff(b.lifespan_days)) * 10_000 / u32::from(u16::MAX);
+    let diet = u32::from(a.diet != b.diet) * 10_000;
+    ((speed + metabolism + fertility + lifespan + diet) / 5) as u16
+}
+
+/// Reproductive compatibility is a symmetric, deterministic comparison of genotype.
+pub fn genomes_compatible(a: &Genome, b: &Genome) -> bool {
+    genetic_distance_basis_points(a, b) <= SPECIES_COMPATIBILITY_THRESHOLD_BP
 }
 
 fn inherit(a: &Genome, b: &Genome, rng: &mut DeterministicRng) -> Genome {
@@ -1139,6 +1399,207 @@ mod tests {
     }
 
     #[test]
+    fn compatibility_is_symmetric_and_ignores_sex() {
+        let mut female = Genome {
+            speed: Alleles {
+                first: 0,
+                second: 0,
+            },
+            ..Genome::default()
+        };
+        female.sex = Sex::Female;
+        let mut male = female.clone();
+        male.sex = Sex::Male;
+        assert_eq!(genetic_distance_basis_points(&female, &male), 0);
+        assert!(genomes_compatible(&female, &male));
+
+        let threshold_edge = Genome {
+            speed: Alleles {
+                first: 1,
+                second: 1,
+            },
+            ..female.clone()
+        };
+        assert_eq!(
+            genetic_distance_basis_points(&female, &threshold_edge),
+            SPECIES_COMPATIBILITY_THRESHOLD_BP
+        );
+        assert!(genomes_compatible(&female, &threshold_edge));
+        let beyond_edge = Genome {
+            speed: Alleles {
+                first: 2,
+                second: 2,
+            },
+            ..female.clone()
+        };
+        assert!(!genomes_compatible(&female, &beyond_edge));
+
+        let mut other_diet = female.clone();
+        other_diet.diet = Diet::Carnivore;
+        assert_eq!(
+            genetic_distance_basis_points(&female, &other_diet),
+            genetic_distance_basis_points(&other_diet, &female)
+        );
+        assert!(!genomes_compatible(&female, &other_diet));
+    }
+
+    #[test]
+    fn autonomous_reproduction_can_speciate_deterministically() {
+        let make_world = || {
+            let mut world = World::new(WorldId::new(), config(0x51_0c1a7e)).unwrap();
+            for tile in &mut world.tiles {
+                tile.resources.vegetation = 1000;
+                tile.resources.water = 1000;
+            }
+            let founder = Genome {
+                speed: Alleles {
+                    first: 0,
+                    second: 0,
+                },
+                metabolism: Alleles {
+                    first: 1,
+                    second: 1,
+                },
+                fertility: Alleles {
+                    first: 100,
+                    second: 100,
+                },
+                ..Genome::default()
+            };
+            world
+                .apply(SimulationCommand::IntroduceOrganism {
+                    x: 5,
+                    y: 5,
+                    genome: founder,
+                })
+                .unwrap();
+            world.apply(SimulationCommand::Start).unwrap();
+            world
+        };
+        let mut a = make_world();
+        let mut b = make_world();
+        for _ in 0..1000 {
+            a.apply(SimulationCommand::Advance { ticks: 1 }).unwrap();
+            b.apply(SimulationCommand::Advance { ticks: 1 }).unwrap();
+            if !a.speciation_events.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            !a.speciation_events.is_empty(),
+            "expected mutation and reproduction to produce a divergent lineage by day {}; population {}, births {}",
+            a.tick,
+            a.organisms.len(),
+            a.statistics.births
+        );
+        assert_eq!(a.snapshot().state_hash, b.snapshot().state_hash);
+        let event = &a.speciation_events[0];
+        assert!(event.genetic_distance_basis_points > event.threshold_basis_points);
+        assert!(a
+            .species_lineages
+            .iter()
+            .any(|lineage| lineage.species_id == event.new_species_id
+                && lineage.parent_species_id == Some(event.parent_species_id)));
+        let checkpoint = a.snapshot();
+        let mut restored = World::restore(&checkpoint).unwrap();
+        assert_eq!(
+            restored.snapshot().speciation_events,
+            checkpoint.speciation_events
+        );
+        a.apply(SimulationCommand::Advance { ticks: 1 }).unwrap();
+        restored
+            .apply(SimulationCommand::Advance { ticks: 1 })
+            .unwrap();
+        assert_eq!(a.snapshot().state_hash, restored.snapshot().state_hash);
+    }
+
+    #[test]
+    fn checkpoint_continuation_preserves_mechanics_and_speciation_history() {
+        let mut world = World::new(WorldId::new(), config(13)).unwrap();
+        let original_version = world.mechanics_version;
+        let checkpoint = world.snapshot();
+        let mut restored = World::restore(&checkpoint).unwrap();
+        assert_eq!(restored.mechanics_version, original_version);
+        assert_eq!(
+            restored.snapshot().speciation_events,
+            checkpoint.speciation_events
+        );
+        world.apply(SimulationCommand::Start).unwrap();
+        restored.apply(SimulationCommand::Start).unwrap();
+        world
+            .apply(SimulationCommand::Advance { ticks: 10 })
+            .unwrap();
+        restored
+            .apply(SimulationCommand::Advance { ticks: 10 })
+            .unwrap();
+        assert_eq!(world.snapshot().state_hash, restored.snapshot().state_hash);
+    }
+
+    #[test]
+    fn allele_history_retains_more_than_the_chart_lineage_limit() {
+        let mut world = World::new(WorldId::new(), config(101)).unwrap();
+        for id in 1..=40_u64 {
+            let genome = Genome::default();
+            world.organisms.push(Organism {
+                id,
+                species_id: id,
+                parent_ids: Vec::new(),
+                x: 0,
+                y: 0,
+                age_days: 0,
+                energy: INITIAL_ENERGY,
+                water_reserve: INITIAL_WATER,
+                genome: genome.clone(),
+            });
+            world.register_founder(id, id, genome);
+        }
+        world.sample_allele_frequencies();
+        let lineages: HashSet<_> = world
+            .allele_frequency_history
+            .iter()
+            .filter(|sample| sample.day == 0)
+            .map(|sample| sample.species_id)
+            .collect();
+        assert_eq!(lineages.len(), 40);
+    }
+
+    #[test]
+    fn legacy_mechanics_version_has_no_automatic_speciation() {
+        let mut world =
+            World::new_with_mechanics(WorldId::new(), config(456), LEGACY_MECHANICS_VERSION)
+                .unwrap();
+        for tile in &mut world.tiles {
+            tile.resources.vegetation = 1000;
+            tile.resources.water = 1000;
+        }
+        let genome = Genome {
+            speed: Alleles {
+                first: 0,
+                second: 0,
+            },
+            metabolism: Alleles {
+                first: 1,
+                second: 1,
+            },
+            fertility: Alleles {
+                first: 100,
+                second: 100,
+            },
+            ..Genome::default()
+        };
+        world
+            .apply(SimulationCommand::IntroduceOrganism { x: 5, y: 5, genome })
+            .unwrap();
+        world.apply(SimulationCommand::Start).unwrap();
+        world
+            .apply(SimulationCommand::Advance { ticks: 100 })
+            .unwrap();
+        assert!(world.statistics.births > 0);
+        assert!(world.speciation_events.is_empty());
+        assert_eq!(world.snapshot().mechanics_version, LEGACY_MECHANICS_VERSION);
+    }
+
+    #[test]
     fn compatible_opposite_sex_founders_reproduce() {
         let mut world = World::new(WorldId::new(), config(789)).unwrap();
         for tile in &mut world.tiles {
@@ -1182,6 +1643,18 @@ mod tests {
                 genome: male,
             })
             .unwrap();
+        // Compatibility is based on genotype, even when provisional lineage labels differ.
+        world.organisms[1].species_id = 999;
+        world.organism_lineage[1].species_id = 999;
+        world.species_lineages.push(SpeciesLineage {
+            species_id: 999,
+            parent_species_id: None,
+            founder_organism_id: 2,
+            founded_day: 0,
+            extinct_day: None,
+            prototype_genome: world.organisms[1].genome.clone(),
+        });
+        world.next_species_id = 1000;
         world.apply(SimulationCommand::Start).unwrap();
         world
             .apply(SimulationCommand::Advance { ticks: 30 })

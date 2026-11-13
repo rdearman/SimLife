@@ -36,7 +36,9 @@ pub async fn app(store: Store) -> Result<Router, Box<dyn std::error::Error + Sen
             Ok(world) => world,
             Err(checkpoint_error) => {
                 tracing::warn!(world_id = %snapshot.id.0, tick = snapshot.tick, %checkpoint_error, "checkpoint restore failed; attempting deterministic command-history recovery");
-                let replayed = store.replay(snapshot.id, snapshot.tick).await?;
+                let replayed = store
+                    .replay_with_mechanics(snapshot.id, snapshot.tick, snapshot.mechanics_version)
+                    .await?;
                 store.checkpoint(&replayed).await?;
                 World::restore(&replayed)?
             }
@@ -236,7 +238,7 @@ async fn replay_world(
     let current = world.lock().await.snapshot();
     let replayed = s
         .store
-        .replay(id, current.tick)
+        .replay_with_mechanics(id, current.tick, current.mechanics_version)
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(serde_json::json!({

@@ -206,8 +206,7 @@ pub struct OrganismLineage {
     pub genome_at_birth: Genome,
 }
 
-/// World-local species identity. M1–M6 do not implement speciation; records identify
-/// the founder lineage and when a currently empty lineage became extinct.
+/// World-local biological classification and genome used as the mating/speciation prototype.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SpeciesLineage {
     pub species_id: u64,
@@ -215,6 +214,19 @@ pub struct SpeciesLineage {
     pub founder_organism_id: u64,
     pub founded_day: u64,
     pub extinct_day: Option<u64>,
+    #[serde(default)]
+    pub prototype_genome: Genome,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SpeciationEvent {
+    pub sequence: u64,
+    pub day: u64,
+    pub parent_species_id: u64,
+    pub new_species_id: u64,
+    pub founder_organism_id: u64,
+    pub genetic_distance_basis_points: u16,
+    pub threshold_basis_points: u16,
 }
 
 /// Copies of each allele value in a sampled species population (two copies per organism).
@@ -267,6 +279,7 @@ pub struct WorldSummary {
     pub width: u16,
     pub height: u16,
     pub population: u32,
+    pub species_count: u32,
     pub statistics: WorldStatistics,
     pub state_hash: String,
 }
@@ -275,6 +288,8 @@ pub struct WorldSummary {
 pub struct WorldSnapshot {
     pub id: WorldId,
     pub config: WorldConfig,
+    #[serde(default = "default_mechanics_version")]
+    pub mechanics_version: u16,
     pub state: RunState,
     pub tick: u64,
     pub width: u16,
@@ -290,9 +305,19 @@ pub struct WorldSnapshot {
     pub organism_lineage: Vec<OrganismLineage>,
     #[serde(default)]
     pub species_lineages: Vec<SpeciesLineage>,
+    #[serde(default)]
+    pub speciation_events: Vec<SpeciationEvent>,
     pub rng_state: u64,
     pub next_organism_id: u64,
+    #[serde(default = "default_next_species_id")]
+    pub next_species_id: u64,
     pub state_hash: String,
+}
+fn default_next_species_id() -> u64 {
+    1
+}
+fn default_mechanics_version() -> u16 {
+    1
 }
 
 /// Compact live update; the initial WebSocket message carries the immutable map once.
@@ -307,6 +332,7 @@ pub struct WorldUpdate {
     pub population_sample: Option<PopulationSample>,
     pub allele_frequency_samples: Vec<AlleleFrequencySample>,
     pub species_lineages: Vec<SpeciesLineage>,
+    pub speciation_events: Vec<SpeciationEvent>,
     pub state_hash: String,
 }
 impl From<&WorldSnapshot> for WorldUpdate {
@@ -331,6 +357,12 @@ impl From<&WorldSnapshot> for WorldUpdate {
                 .cloned()
                 .collect(),
             species_lineages: snapshot.species_lineages.clone(),
+            speciation_events: snapshot
+                .speciation_events
+                .iter()
+                .filter(|event| event.day == snapshot.tick)
+                .cloned()
+                .collect(),
         }
     }
 }
