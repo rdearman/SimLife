@@ -1,6 +1,7 @@
 use serde_json::json;
 use simlife_domain::{
-    Alleles, Genome, SimulationCommand, WorldConfig, WorldId, WorldSize, WorldSnapshot,
+    Alleles, Diet, Genome, RunState, Sex, SimulationCommand, WorldConfig, WorldId, WorldSize,
+    WorldSnapshot,
 };
 use simlife_engine::{World, CURRENT_MECHANICS_VERSION, LEGACY_MECHANICS_VERSION};
 use std::{collections::HashMap, env, fs, hint::black_box, process::ExitCode, time::Instant};
@@ -10,7 +11,7 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("{message}");
-            eprintln!("usage: simlife-bench <organisms> [ticks] [seed] [small|medium|large] [sterile|reproductive]\n       simlife-bench stability [seed] [founders] [small|medium|large] [fertility:1..100] [1|2|both]");
+            eprintln!("usage: simlife-bench <organisms> [ticks] [seed] [small|medium|large] [sterile|reproductive]\n       simlife-bench stability [seed] [founders] [small|medium|large] [fertility:1..100] [1|2|both]\n       simlife-bench gameplay [seed] [days]");
             ExitCode::FAILURE
         }
     }
@@ -21,6 +22,9 @@ fn run() -> Result<(), String> {
     let first = args.next();
     if first.as_deref() == Some("stability") {
         return run_stability(args);
+    }
+    if first.as_deref() == Some("gameplay") {
+        return run_gameplay(args);
     }
     let population = parse_arg(first, 1_000_usize, "organisms")?;
     let ticks = parse_arg(args.next(), 100_u64, "ticks")?;
@@ -241,6 +245,421 @@ fn run_stability_cohort(
     }))
 }
 
+/// Runs a compact, seeded set of game-facing experiments. Results are evidence about
+/// outcomes and agency signals; they are not a substitute for human playtesting.
+fn run_gameplay(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    let seed = parse_arg(args.next(), 20_261_113_u64, "seed")?;
+    let days = parse_arg(args.next(), 1_000_u64, "days")?;
+    if args.next().is_some() || !(100..=100_000).contains(&days) || seed == 0 {
+        return Err(
+            "seed must be non-zero, days must be 100..=100000, and no extra arguments are accepted"
+                .into(),
+        );
+    }
+    let started = Instant::now();
+    let experiments = run_gameplay_suite(seed, days)?;
+    println!(
+        "{}",
+        json!({
+            "benchmark": "gameplay_validation",
+            "seed": seed,
+            "days": days,
+            "mechanics_version": CURRENT_MECHANICS_VERSION,
+            "elapsed_seconds": started.elapsed().as_secs_f64(),
+            "experiments": experiments,
+            "scorecard": {
+                "agency": {"status": "partially_testable", "evidence": "matched genome choices and interventions are compared"},
+                "tradeoffs": {"status": "not_established", "evidence": "one seed and a limited trait set cannot identify universally inferior strategies"},
+                "feedback": {"status": "partially_testable", "evidence": "population, diet, births, deaths, predation and hashes are reported"},
+                "challenge": {"status": "not_established", "evidence": "the engine has no objectives, difficulty setting or win/loss state"},
+                "emergence": {"status": "partially_testable", "evidence": "population, diet and lineage outcomes vary under interventions"},
+                "replayability": {"status": "testable", "evidence": "identical snapshot branches are hash-compared against a changed experiment"},
+                "human_enjoyment": "requires playtesting"
+            },
+            "known_limits": [
+                "The engine has no editable climate or resource controls; survival uses the driest/lowest-vegetation seed found in a 12-seed search.",
+                "Agent strategies are fixed genome recipes; there is no decision-making or adaptive player agent.",
+                "Interventions can introduce organisms, but cannot remove organisms or alter terrain/resources.",
+                "Lineage records are ancestry branches and are not validated as reproductively isolated species."
+            ],
+            "process_peak_memory_kib": memory_kib("VmHWM")
+        })
+    );
+    Ok(())
+}
+
+fn run_gameplay_suite(seed: u64, days: u64) -> Result<Vec<serde_json::Value>, String> {
+    Ok(vec![
+        survival_experiment(seed, days)?,
+        evolution_experiment(seed, days)?,
+        predator_prey_experiment(seed, days)?,
+        intervention_experiment(seed, days)?,
+        replay_experiment(seed, days)?,
+    ])
+}
+
+fn survival_experiment(seed: u64, days: u64) -> Result<serde_json::Value, String> {
+    let candidate_count = 12_u64;
+    let mut candidates = Vec::new();
+    for offset in 0..candidate_count {
+        let candidate_seed = seed.wrapping_mul(1_000).wrapping_add(offset).max(1);
+        let world = new_game_world(candidate_seed, "survival-environment")?;
+        let snapshot = world.snapshot();
+        let vegetation = snapshot
+            .tiles
+            .iter()
+            .map(|tile| u64::from(tile.resources.vegetation))
+            .sum::<u64>();
+        let water = snapshot
+            .tiles
+            .iter()
+            .map(|tile| u64::from(tile.resources.water))
+            .sum::<u64>();
+        let deserts = snapshot
+            .tiles
+            .iter()
+            .filter(|tile| tile.terrain == simlife_domain::TerrainType::Desert)
+            .count();
+        candidates.push((
+            vegetation.saturating_add(water),
+            candidate_seed,
+            vegetation,
+            water,
+            deserts,
+        ));
+    }
+    candidates.sort_by_key(|candidate| (candidate.0, candidate.1));
+    let (_, challenge_seed, vegetation, water, deserts) = candidates[0];
+    let profiles = [
+        (
+            "specialist_low_metabolism",
+            Genome {
+                speed: alleles(1),
+                metabolism: alleles(0),
+                fertility: alleles(20),
+                lifespan_days: 1500,
+                diet: Diet::Herbivore,
+                sex: Sex::Asexual,
+            },
+        ),
+        ("random_genome_baseline", random_genome(seed ^ 0x5345_4544)),
+    ];
+    let mut outcomes = Vec::new();
+    for (name, profile) in profiles {
+        let mut world = new_game_world(challenge_seed, name)?;
+        let genomes = if name == "random_genome_baseline" {
+            (0..32)
+                .map(|i| {
+                    let mut genome = random_genome(seed.wrapping_add(i));
+                    genome.fertility = alleles(20);
+                    genome.lifespan_days = 1500;
+                    genome
+                })
+                .collect::<Vec<_>>()
+        } else {
+            vec![profile.clone(); 32]
+        };
+        populate(&mut world, &genomes, 0)?;
+        advance(&mut world, days)?;
+        let recipe = if name == "random_genome_baseline" {
+            json!({"varying_traits":["speed","metabolism","diet"],"fixed_fertility":20,"fixed_lifespan_days":1500,"sex":"asexual"})
+        } else {
+            json!(profile)
+        };
+        outcomes.push(json!({"strategy":name,"initial_population":32,"final":world_metrics(&world),"genome_recipe":recipe}));
+    }
+    Ok(
+        json!({"id":"survival_challenge","environment":"minimum initial water+vegetation among 12 candidate seeds","environment_seed":challenge_seed,"initial_vegetation":vegetation,"initial_water":water,"desert_tiles":deserts,"outcomes":outcomes}),
+    )
+}
+
+fn evolution_experiment(seed: u64, days: u64) -> Result<serde_json::Value, String> {
+    let mut world = new_game_world(seed, "diverging-populations")?;
+    let slow = Genome {
+        speed: alleles(0),
+        metabolism: alleles(3),
+        fertility: alleles(20),
+        lifespan_days: 700,
+        diet: Diet::Herbivore,
+        sex: Sex::Asexual,
+    };
+    let fast = Genome {
+        speed: alleles(4),
+        metabolism: alleles(3),
+        fertility: alleles(20),
+        lifespan_days: 700,
+        diet: Diet::Herbivore,
+        sex: Sex::Asexual,
+    };
+    let mut founders = vec![slow; 20];
+    founders.extend(vec![fast; 20]);
+    populate(&mut world, &founders, 3)?;
+    advance(&mut world, days)?;
+    let snapshot = world.snapshot();
+    let lineages_by_id: HashMap<_, _> = snapshot
+        .species_lineages
+        .iter()
+        .map(|lineage| (lineage.species_id, lineage))
+        .collect();
+    let groups = [("slow", 1_u64, 20_u64), ("fast", 21, 40)].into_iter().map(|(name, first, last)| {
+        let lineages: Vec<_> = snapshot.species_lineages.iter().filter(|lineage| {
+            lineage_root_founder(lineage.species_id, &lineages_by_id).is_some_and(|founder| (first..=last).contains(&founder))
+        }).collect();
+        let group_lineage_ids: std::collections::HashSet<_> = lineages.iter().map(|lineage| lineage.species_id).collect();
+        let living = snapshot.organisms.iter().filter(|organism| group_lineage_ids.contains(&organism.species_id)).count();
+        json!({"strategy":name,"population":living,"lineage_branches":lineages.len(),"speciation_events":snapshot.speciation_events.iter().filter(|event| group_lineage_ids.contains(&event.new_species_id)).count()})
+    }).collect::<Vec<_>>();
+    Ok(
+        json!({"id":"diverging_populations","setup":"20 low-speed and 20 high-speed asexual herbivores in one seeded world","groups":groups,"final":world_metrics(&world)}),
+    )
+}
+
+fn lineage_root_founder(
+    species_id: u64,
+    lineages: &HashMap<u64, &simlife_domain::SpeciesLineage>,
+) -> Option<u64> {
+    let mut current = species_id;
+    loop {
+        let lineage = lineages.get(&current)?;
+        if let Some(parent_id) = lineage.parent_species_id {
+            current = parent_id;
+        } else {
+            return Some(lineage.founder_organism_id);
+        }
+    }
+}
+
+fn predator_prey_experiment(seed: u64, days: u64) -> Result<serde_json::Value, String> {
+    let mut world = new_game_world(seed, "predator-prey")?;
+    let prey = Genome {
+        speed: alleles(2),
+        metabolism: alleles(2),
+        fertility: alleles(15),
+        lifespan_days: 700,
+        diet: Diet::Herbivore,
+        sex: Sex::Asexual,
+    };
+    let predator = Genome {
+        speed: alleles(3),
+        metabolism: alleles(2),
+        fertility: alleles(8),
+        lifespan_days: 600,
+        diet: Diet::Carnivore,
+        sex: Sex::Asexual,
+    };
+    let mut founders = vec![prey; 32];
+    founders.extend(vec![predator; 8]);
+    populate(&mut world, &founders, 0)?;
+    advance(&mut world, days)?;
+    Ok(
+        json!({"id":"predator_prey","setup":"32 herbivores and 8 carnivores released at shared habitat coordinates","final":world_metrics(&world),"interpretation":"Predation deaths and final diet counts indicate whether this setup creates an observable food-chain response."}),
+    )
+}
+
+fn intervention_experiment(seed: u64, days: u64) -> Result<serde_json::Value, String> {
+    let mut initial = new_game_world(seed, "ecosystem-branch")?;
+    let prey = Genome {
+        speed: alleles(2),
+        metabolism: alleles(2),
+        fertility: alleles(15),
+        lifespan_days: 700,
+        diet: Diet::Herbivore,
+        sex: Sex::Asexual,
+    };
+    let predator = Genome {
+        speed: alleles(3),
+        metabolism: alleles(2),
+        fertility: alleles(8),
+        lifespan_days: 600,
+        diet: Diet::Carnivore,
+        sex: Sex::Asexual,
+    };
+    let mut founders = vec![prey.clone(); 24];
+    founders.extend(vec![predator.clone(); 6]);
+    populate(&mut initial, &founders, 0)?;
+    let branch_day = (days / 3).max(1);
+    advance(&mut initial, branch_day)?;
+    let checkpoint = initial.snapshot();
+    let mut control = World::restore(&checkpoint).map_err(|error| error.to_string())?;
+    let mut disruption = World::restore(&checkpoint).map_err(|error| error.to_string())?;
+    let mut restoration = World::restore(&checkpoint).map_err(|error| error.to_string())?;
+    let extra_predator = Genome {
+        fertility: alleles(0),
+        ..predator
+    };
+    introduce_group(&mut disruption, &vec![extra_predator.clone(); 16], 13)?;
+    introduce_group(&mut restoration, &vec![extra_predator; 16], 13)?;
+    advance(&mut control, days - branch_day)?;
+    let intervention_days = (days - branch_day) / 2;
+    advance(&mut disruption, days - branch_day)?;
+    advance(&mut restoration, intervention_days)?;
+    introduce_group(&mut restoration, &vec![prey; 24], 29)?;
+    advance(&mut restoration, days - branch_day - intervention_days)?;
+    Ok(
+        json!({"id":"ecological_intervention","branch_day":branch_day,"setup":"control vs +16 carnivores; restoration branch adds 24 herbivores halfway through","outcomes":{"control":world_metrics(&control),"predator_introduction":world_metrics(&disruption),"predator_then_herbivore_introduction":world_metrics(&restoration)}}),
+    )
+}
+
+fn replay_experiment(seed: u64, days: u64) -> Result<serde_json::Value, String> {
+    let mut initial = new_game_world(seed, "replay-branch")?;
+    let founders = vec![
+        Genome {
+            fertility: alleles(12),
+            ..Genome::default()
+        };
+        20
+    ];
+    populate(&mut initial, &founders, 2)?;
+    advance(&mut initial, days / 4)?;
+    let branch = initial.snapshot();
+    let mut first = World::restore(&branch).map_err(|error| error.to_string())?;
+    let mut replay = World::restore(&branch).map_err(|error| error.to_string())?;
+    let extra = Genome {
+        diet: Diet::Omnivore,
+        fertility: alleles(25),
+        ..Genome::default()
+    };
+    let position = 7;
+    for world in [&mut first, &mut replay] {
+        world
+            .apply(SimulationCommand::IntroduceOrganism {
+                x: position,
+                y: position,
+                genome: extra.clone(),
+            })
+            .map_err(|error| error.to_string())?;
+    }
+    advance(&mut first, days - days / 4)?;
+    advance(&mut replay, days - days / 4)?;
+    let identical_hashes_match = first.summary().state_hash == replay.summary().state_hash;
+    let control_hash = first.summary().state_hash;
+    let mut alternative = World::restore(&branch).map_err(|error| error.to_string())?;
+    let different = Genome {
+        diet: Diet::Herbivore,
+        fertility: alleles(40),
+        ..Genome::default()
+    };
+    alternative
+        .apply(SimulationCommand::IntroduceOrganism {
+            x: position,
+            y: position,
+            genome: different,
+        })
+        .map_err(|error| error.to_string())?;
+    advance(&mut alternative, days - days / 4)?;
+    Ok(
+        json!({"id":"replay_and_hypothesis","identical_branch_hashes_match":identical_hashes_match,"alternative_genome_changes_hash":control_hash!=alternative.summary().state_hash,"repeated_intervention":world_metrics(&first),"alternative_intervention":world_metrics(&alternative)}),
+    )
+}
+
+fn new_game_world(seed: u64, name: &str) -> Result<World, String> {
+    World::new_with_mechanics(
+        WorldId::new(),
+        WorldConfig {
+            name: name.into(),
+            seed: seed.max(1),
+            size: WorldSize::Small,
+            tick_duration_ms: 1000,
+        },
+        CURRENT_MECHANICS_VERSION,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn populate(world: &mut World, genomes: &[Genome], offset: u16) -> Result<(), String> {
+    for (index, genome) in genomes.iter().enumerate() {
+        let x = (offset + ((index as u16 * 7) % 32)) % 32;
+        let y = (index as u16 * 13 + offset) % 64;
+        world
+            .apply(SimulationCommand::IntroduceOrganism {
+                x,
+                y,
+                genome: genome.clone(),
+            })
+            .map_err(|error| error.to_string())?;
+    }
+    world
+        .apply(SimulationCommand::Start)
+        .map_err(|error| error.to_string())
+}
+
+fn introduce_group(world: &mut World, genomes: &[Genome], offset: u16) -> Result<(), String> {
+    for (index, genome) in genomes.iter().enumerate() {
+        let x = (offset + ((index as u16 * 5) % 32)) % 32;
+        let y = (index as u16 * 11 + offset) % 64;
+        world
+            .apply(SimulationCommand::IntroduceOrganism {
+                x,
+                y,
+                genome: genome.clone(),
+            })
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn advance(world: &mut World, days: u64) -> Result<(), String> {
+    if world.summary().state == RunState::Created {
+        world
+            .apply(SimulationCommand::Start)
+            .map_err(|error| error.to_string())?;
+    }
+    let mut remaining = days;
+    while remaining > 0 {
+        let ticks = remaining.min(100);
+        world
+            .apply(SimulationCommand::Advance { ticks })
+            .map_err(|error| error.to_string())?;
+        remaining -= ticks;
+    }
+    Ok(())
+}
+
+fn world_metrics(world: &World) -> serde_json::Value {
+    let snapshot = world.snapshot();
+    let mut diets = HashMap::new();
+    for organism in &snapshot.organisms {
+        *diets
+            .entry(format!("{:?}", organism.genome.diet).to_lowercase())
+            .or_insert(0_u64) += 1;
+    }
+    let extinct_lineages = snapshot
+        .species_lineages
+        .iter()
+        .filter(|lineage| lineage.extinct_day.is_some())
+        .count();
+    json!({"day":snapshot.tick,"population":snapshot.organisms.len(),"diet_counts":diets,"births":snapshot.statistics.births,"deaths":snapshot.statistics.deaths,"predation_deaths":snapshot.statistics.predation_deaths,"lineage_branches":snapshot.species_lineages.len(),"extant_lineage_branches":snapshot.species_lineages.len()-extinct_lineages,"state_hash":snapshot.state_hash})
+}
+
+fn alleles(value: u8) -> Alleles {
+    Alleles {
+        first: value,
+        second: value,
+    }
+}
+
+fn random_genome(mut state: u64) -> Genome {
+    let mut draw = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let diet = match draw() % 3 {
+        0 => Diet::Herbivore,
+        1 => Diet::Carnivore,
+        _ => Diet::Omnivore,
+    };
+    Genome {
+        speed: alleles((draw() % 5) as u8),
+        metabolism: alleles((draw() % 21) as u8),
+        fertility: alleles((draw() % 31) as u8),
+        lifespan_days: (100 + draw() % 901) as u16,
+        diet,
+        sex: Sex::Asexual,
+    }
+}
+
 fn stability_metrics(snapshot: &WorldSnapshot, elapsed_seconds: f64) -> serde_json::Value {
     let total_lineages = snapshot.species_lineages.len();
     let extinct_lineages = snapshot
@@ -323,4 +742,20 @@ fn memory_kib(field: &str) -> Option<u64> {
         }
         value.split_whitespace().next()?.parse().ok()
     })
+}
+
+#[cfg(test)]
+mod gameplay_tests {
+    use super::run_gameplay_suite;
+
+    #[test]
+    fn gameplay_experiments_are_repeatable_and_cover_the_five_cases() {
+        let first = run_gameplay_suite(20_261_113, 100).expect("first experiment suite");
+        let replay = run_gameplay_suite(20_261_113, 100).expect("repeated experiment suite");
+
+        assert_eq!(first, replay);
+        assert_eq!(first.len(), 5);
+        assert!(first[4]["identical_branch_hashes_match"].as_bool() == Some(true));
+        assert!(first[4]["alternative_genome_changes_hash"].as_bool() == Some(true));
+    }
 }

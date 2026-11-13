@@ -106,13 +106,23 @@ cargo run --release -p simlife-bench -- stability 20261113 1 small 20 both
 
 Arguments are seed, founder count, map size, expressed fertility (1–100), and mechanics selection (`1`, `2`, or `both`). For a recorded run and its limitations, see [`docs/benchmarks/2026-11-13-evolutionary-stability.md`](docs/benchmarks/2026-11-13-evolutionary-stability.md).
 
+### Gameplay validation experiments
+
+Run five deterministic game-facing experiments for a seed, defaulting to 1,000 days. They compare a low-metabolism design to random trait recipes in a resource-poor generated habitat, compare fast and slow herbivore populations, run a predator–prey introduction, fork an established ecosystem for control/disruption/restoration attempts, and compare identical and changed experiment branches:
+
+```sh
+cargo run --release -p simlife-bench -- gameplay 20261113 1000
+```
+
+The command prints JSON metrics and a machine-evidence scorecard. It does not assign subjective gameplay scores: human agency, challenge, trade-offs and enjoyment require unassisted playtesting. Results and the proposed acceptance protocol are in [`docs/gameplay-validation.md`](docs/gameplay-validation.md). The currently serialized `species_*` fields refer to genealogical lineage branches. Pairwise genetic compatibility gates mating; a lineage label does not define a reproductively isolated biological species.
+
 The simulation records population, diet counts, average expressed speed/metabolism/fertility, and cumulative births/deaths every 10 days. The rolling history holds up to 20,000 samples (200,000 simulated days); checkpoints preserve it. The browser plots total population and population by diet. World listing returns compact summaries; selecting a world fetches its full map and history.
 
 ## Evolutionary observability
 
-Every organism has a stable world-local ID and permanent lineage record with parent IDs, birth day, birth genome, species-lineage ID, and death day when applicable. Introduced organisms are founders without parents. Individual inspection reports both parents and offspring, and ancestry follows the first parent branch, nearest ancestor first; the API caps requested depth at 100. Click an organism on the map to inspect its current variables, genome, parents, offspring and ancestry. Inspect with `GET /api/v1/worlds/{world_id}/organisms/{organism_id}?ancestors=10`.
+Every organism has a stable world-local ID and permanent lineage record with parent IDs, birth day, birth genome, lineage ID (currently serialized as `species_id`), and death day when applicable. Introduced organisms are founders without parents. Individual inspection reports both parents and offspring, and ancestry follows the first parent branch, nearest ancestor first; the API caps requested depth at 100. Click an organism on the map to inspect its current variables, genome, parents, offspring and ancestry. Inspect with `GET /api/v1/worlds/{world_id}/organisms/{organism_id}?ancestors=10`.
 
-World snapshots store per-species allele copy counts for speed (0–4), metabolism (0–20), and fertility (0–100), sampled every 10 days. Each vector index is an allele value and each count is the number of copies, so the sum is twice the sampled population. Every lineage present in a sample is recorded; the history retains at most 100,000 lineage-sample rows. The browser limits its chart selector to the first 32 lineages for presentation, but this does not cap species or stored lineage history. `species_lineages` retain prototype genomes, founder identity and extinction day, while `speciation_events` record parent lineage, new lineage, founder, day and measured genetic distance.
+World snapshots store per-lineage allele copy counts for speed (0–4), metabolism (0–20), and fertility (0–100), sampled every 10 days. Each vector index is an allele value and each count is the number of copies, so the sum is twice the sampled population. Every lineage present in a sample is recorded; the history retains at most 100,000 lineage-sample rows. The browser limits its chart selector to the first 32 lineages for presentation, but this does not cap lineages or stored lineage history. `species_lineages` retain prototype genomes, founder identity and extinction day, while `speciation_events` record parent lineage, new lineage, founder, day and measured genetic distance. These are branching ancestry records, not assigned biological species groups; biological species membership is not currently modeled.
 
 ### Compatibility and automatic speciation (mechanics version 2)
 
